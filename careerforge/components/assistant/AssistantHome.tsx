@@ -3,14 +3,6 @@
 import { FormEvent, useRef, useState, useEffect, ChangeEvent } from "react";
 import { useApp } from "@/lib/store";
 import { FeatureId, ResumeTab, ParsedIntent } from "@/lib/intent";
-import {
-  speakText,
-  stopSpeaking,
-  startSpeechRecognition,
-  SpeechRecognitionController,
-  isSpeechRecognitionSupported,
-  isSpeechSynthesisSupported,
-} from "@/lib/voice";
 
 export type Msg = {
   id: string;
@@ -20,7 +12,6 @@ export type Msg = {
   attachedDocName?: string;
   intent?: ParsedIntent;
   redirecting?: boolean;
-  engine?: string;
 };
 
 export interface Conversation {
@@ -65,62 +56,9 @@ export function AssistantHome({
   } | null>(null);
   const [parsingDoc, setParsingDoc] = useState(false);
 
-  // ─── Voice & Accessibility State ──────────────────────────────────────────
-  const [listening, setListening] = useState(false);
-  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
-  const [micError, setMicError] = useState<string | null>(null);
-  const speechControllerRef = useRef<SpeechRecognitionController | null>(null);
-
   const listRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // Cleanup speech on unmount
-  useEffect(() => {
-    return () => {
-      stopSpeaking();
-      speechControllerRef.current?.stop();
-    };
-  }, []);
-
-  const toggleListening = () => {
-    if (listening) {
-      speechControllerRef.current?.stop();
-      setListening(false);
-      return;
-    }
-    setMicError(null);
-    const controller = startSpeechRecognition({
-      onTranscript: (transcript, isFinal) => {
-        setInput((prev) => {
-          const trimmed = prev.trim();
-          return trimmed ? `${trimmed} ${transcript}` : transcript;
-        });
-      },
-      onListeningChange: (isList) => {
-        setListening(isList);
-      },
-      onError: (err) => {
-        setMicError(err);
-        setListening(false);
-      },
-    });
-    speechControllerRef.current = controller;
-  };
-
-  const toggleSpeech = (msgId: string, text: string) => {
-    if (speakingMsgId === msgId) {
-      stopSpeaking();
-      setSpeakingMsgId(null);
-      return;
-    }
-    stopSpeaking();
-    setSpeakingMsgId(msgId);
-    speakText(text, {
-      onEnd: () => setSpeakingMsgId(null),
-      onError: () => setSpeakingMsgId(null),
-    });
-  };
 
   const userDisplayName = user?.name
     ? user.name.split(" ")[0]
@@ -363,7 +301,6 @@ export function AssistantHome({
             targetRole: user?.targetRole || undefined,
           },
           targetRole: user?.targetRole || "frontend",
-          voiceMode,
         }),
       });
 
@@ -372,7 +309,7 @@ export function AssistantHome({
 
       const replyText =
         data.reply ||
-        "I'm right here with you. What would you like to explore or work on today?";
+        "I'm here to support your career journey. What would you like to explore next?";
       const replyTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       const hasFeature = Boolean(data.feature);
 
@@ -394,7 +331,6 @@ export function AssistantHome({
           text: replyText,
           intent,
           redirecting: hasFeature,
-          engine: data.engine || "CareerForge AI",
         },
       ];
 
@@ -408,11 +344,6 @@ export function AssistantHome({
         conversations.map((c) => (c.id === finalizedConv.id ? finalizedConv : c))
       );
       scrollToBottom();
-
-      // Automatically speak the response if in Voice Mode
-      if (voiceMode) {
-        speakText(replyText);
-      }
 
       if (hasFeature && data.feature) {
         setRedirectCountdown(3);
@@ -431,7 +362,7 @@ export function AssistantHome({
           id: `ai-${Date.now()}`,
           role: "assistant",
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          text: "I am right here with you! What would you like to chat about or explore today?",
+          text: "I am right here with you. Would you like to review your career roadmap, find top courses, or practice interview questions?",
         },
       ];
       saveConversations(
@@ -673,35 +604,6 @@ export function AssistantHome({
                   >
                     <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-neutral-400 px-1">
                       <span>{isUser ? userDisplayName : "CareerForge AI"}</span>
-                      {m.engine && !isUser && (
-                        <span className="rounded bg-neutral-100 px-1.5 py-0.2 text-[9px] font-mono text-neutral-600 border border-neutral-200">
-                          {m.engine}
-                        </span>
-                      )}
-                      {!isUser && (
-                        <button
-                          type="button"
-                          onClick={() => toggleSpeech(m.id, m.text)}
-                          className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium transition-all cursor-pointer ${
-                            speakingMsgId === m.id
-                              ? "bg-blue-100 text-blue-800 animate-pulse border border-blue-300 shadow-2xs"
-                              : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800"
-                          }`}
-                          title={speakingMsgId === m.id ? "Stop reading aloud" : "Click-to-Voice (Listen Aloud)"}
-                        >
-                          {speakingMsgId === m.id ? (
-                            <>
-                              <StopIcon className="w-2.5 h-2.5 text-blue-600" />
-                              <span>Stop</span>
-                            </>
-                          ) : (
-                            <>
-                              <SpeakerIcon className="w-2.5 h-2.5" />
-                              <span>Listen</span>
-                            </>
-                          )}
-                        </button>
-                      )}
                       {m.time && <span>&bull; {m.time}</span>}
                     </div>
 
@@ -769,22 +671,17 @@ export function AssistantHome({
                 );
               })}
 
-              {/* AI Thinking / Reasoning Indicator */}
+              {/* AI Thinking Indicator */}
               {busy && redirectCountdown === null && (
-                <div className="flex flex-col items-start animate-in fade-in">
-                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-indigo-600 px-1">
-                    <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-600"></span>
-                    </span>
-                    <span>AI is thinking & reasoning…</span>
+                <div className="flex flex-col items-start">
+                  <div className="mb-1 text-[11px] font-medium text-neutral-400 px-1">
+                    CareerForge AI is thinking…
                   </div>
-                  <div className="rounded-2xl rounded-tl-xs border border-indigo-100 bg-gradient-to-r from-indigo-50/70 via-white to-blue-50/50 px-4 py-3 shadow-xs">
+                  <div className="rounded-2xl rounded-tl-xs border border-neutral-200 bg-white px-4 py-3 shadow-xs">
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:-0.3s]" />
-                      <span className="h-2 w-2 rounded-full bg-indigo-600 animate-bounce [animation-delay:-0.15s]" />
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
-                      <span className="ml-2 text-xs font-medium text-neutral-500">Synthesizing response</span>
+                      <span className="h-2 w-2 rounded-full bg-neutral-400 animate-bounce [animation-delay:-0.3s]" />
+                      <span className="h-2 w-2 rounded-full bg-neutral-400 animate-bounce [animation-delay:-0.15s]" />
+                      <span className="h-2 w-2 rounded-full bg-neutral-400 animate-bounce" />
                     </div>
                   </div>
                 </div>
@@ -853,44 +750,21 @@ export function AssistantHome({
 
               {/* Bottom Control Bar inside Composer */}
               <div className="flex items-center justify-between pt-2 border-t border-neutral-200/50 mt-1">
-                {/* Left: Document Upload & Voice Dictation Actions */}
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={parsingDoc}
-                    title="Attach document (PDF, DOCX, TXT)"
-                    className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-200/70 hover:text-neutral-900 transition-colors disabled:opacity-50"
-                  >
-                    {parsingDoc ? (
-                      <span className="h-3.5 w-3.5 rounded-full border-2 border-neutral-500 border-t-transparent animate-spin" />
-                    ) : (
-                      <PaperclipIcon className="w-3.5 h-3.5 text-neutral-500" />
-                    )}
-                    <span className="hidden sm:inline">Attach</span>
-                  </button>
-
-                  {/* Unlimited Voice Dictation (STT) */}
-                  <button
-                    type="button"
-                    onClick={toggleListening}
-                    className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-all ${
-                      listening
-                        ? "bg-red-500 text-white animate-pulse shadow-sm"
-                        : "text-neutral-600 hover:bg-neutral-200/70 hover:text-neutral-900"
-                    }`}
-                    title={listening ? "Listening... click to stop" : "Voice Dictation (Browser Web Speech API)"}
-                  >
-                    <MicIcon className={`w-3.5 h-3.5 ${listening ? "text-white animate-bounce" : "text-neutral-500"}`} />
-                    <span>{listening ? "Listening…" : "Voice"}</span>
-                  </button>
-
-                  {micError && (
-                    <span className="text-[10px] text-red-600 truncate max-w-[120px]">
-                      {micError}
-                    </span>
+                {/* Left: Document Upload Action */}
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={parsingDoc}
+                  title="Attach document (PDF, DOCX, TXT)"
+                  className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-200/70 hover:text-neutral-900 transition-colors disabled:opacity-50"
+                >
+                  {parsingDoc ? (
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-neutral-500 border-t-transparent animate-spin" />
+                  ) : (
+                    <PaperclipIcon className="w-3.5 h-3.5 text-neutral-500" />
                   )}
-                </div>
+                  <span className="hidden sm:inline">Attach document</span>
+                </button>
 
                 {/* Right: Circular Send Button (ChatGPT style ↑) */}
                 <button
@@ -1000,34 +874,6 @@ function ArrowUpIcon({ className = "w-4 h-4" }: { className?: string }) {
   return (
     <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 19V5M5 12l7-7 7 7" />
-    </svg>
-  );
-}
-
-function SpeakerIcon({ className = "w-3.5 h-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-      <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
-    </svg>
-  );
-}
-
-function MicIcon({ className = "w-3.5 h-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-      <line x1="12" y1="19" x2="12" y2="23" />
-      <line x1="8" y1="23" x2="16" y2="23" />
-    </svg>
-  );
-}
-
-function StopIcon({ className = "w-3.5 h-3.5" }: { className?: string }) {
-  return (
-    <svg className={className} fill="currentColor" viewBox="0 0 24 24">
-      <rect x="6" y="6" width="12" height="12" rx="2" />
     </svg>
   );
 }

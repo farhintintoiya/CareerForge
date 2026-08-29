@@ -5,8 +5,8 @@
  *
  * Runs 3 analysis engines in parallel and merges results:
  *   1. Enhanced heuristic (local, always available)
- *   2. GitHub trending skills (GitHub Public API, 100% free)
- *   3. Multi-Model AI Engine (GitHub Models / Gemini / Free Open-Source LLM)
+ *   2. GitHub trending skills (GitHub API, no key needed)
+ *   3. Gemini 1.5 Flash AI (requires GEMINI_API_KEY env var)
  *
  * Returns: EnhancedAnalysis JSON
  */
@@ -87,13 +87,13 @@ async function runGithubEngine(role: string): Promise<EngineResult> {
   }
 }
 
-// ─── Multi-Model AI Engine (GitHub Models / Gemini / Free Open-Source LLM) ───
-async function runMultiModelAiEngine(
+// ─── Gemini AI Engine ─────────────────────────────────────────────────────────
+async function runGeminiEngine(
   resumeText: string,
   role: string
 ): Promise<EngineResult & { roadmap?: SkillGapItem[] }> {
   const base: EngineResult & { roadmap?: SkillGapItem[] } = {
-    name: "AI Skill Gap & ATS Engine",
+    name: "Gemini AI Analysis",
     score: 0,
     matchedSkills: [],
     missingSkills: [],
@@ -101,143 +101,82 @@ async function runMultiModelAiEngine(
     available: false,
   };
 
-  const prompt = `You are a Principal Tech Recruiter and Resume Auditor.
-Analyze this resume for a ${role} position and return ONLY valid JSON (no extra text, no markdown formatting):
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return base;
+
+  const prompt = `You are an expert technical recruiter and career coach.
+Analyze this resume for a ${role} role and return ONLY valid JSON (no markdown, no explanation):
 
 {
-  "atsScore": 85,
-  "matchedSkills": ["React", "TypeScript", "Tailwind CSS"],
-  "missingSkills": ["Next.js SSR", "GraphQL", "Docker"],
-  "suggestions": [
-    "Quantify key accomplishments with metrics (e.g., reduced bundle size by 30%)",
-    "Highlight full-lifecycle production deployments"
-  ],
+  "atsScore": <0-100 integer>,
+  "matchedSkills": ["skill1", "skill2"],
+  "missingSkills": ["skill1", "skill2"],
+  "suggestions": ["actionable tip 1", "actionable tip 2"],
   "skillGapRoadmap": [
     {
-      "skill": "Next.js Architecture",
-      "priority": "high",
-      "why": "Next.js App Router and SSR are standard in modern ${role} stacks.",
+      "skill": "Skill Name",
+      "priority": "high|medium|low",
+      "why": "one sentence explaining why this skill matters for ${role}",
       "resources": [
-        { "label": "Next.js Official Learn", "url": "https://nextjs.org/learn" }
+        { "label": "Resource name", "url": "https://..." }
       ]
     }
   ]
 }
 
-Resume to analyze:
+Resume:
 ---
-${resumeText.slice(0, 5000)}
+${resumeText.slice(0, 6000)}
 ---`;
 
-  // 1. Try Gemini API
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (geminiKey && geminiKey.trim().length > 5) {
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.2, maxOutputTokens: 1500 },
-          }),
-          signal: AbortSignal.timeout(10000),
-        }
-      );
-
-      if (res.ok) {
-        const data = await res.json();
-        const rawText: string = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-        const parsed = parseJsonSafe(rawText);
-        if (parsed) return formatAiResult(parsed, "Gemini AI Analysis");
-      }
-    } catch (err) {
-      console.warn("[analyze] Gemini error, trying fallback engine:", err);
-    }
-  }
-
-  // 2. Try GitHub Models API
-  const ghToken = process.env.GITHUB_TOKEN || process.env.GITHUB_MODELS_TOKEN;
-  if (ghToken && ghToken.trim().length > 5) {
-    try {
-      const res = await fetch("https://models.inference.ai.azure.com/chat/completions", {
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+      {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${ghToken}`,
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: [{ role: "user", content: prompt }],
-          model: "gpt-4o-mini",
-          temperature: 0.2,
-          max_tokens: 1200,
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 1500 },
         }),
-        signal: AbortSignal.timeout(8000),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const raw = data?.choices?.[0]?.message?.content || "";
-        const parsed = parseJsonSafe(raw);
-        if (parsed) return formatAiResult(parsed, "GitHub Models AI Analysis");
+        signal: AbortSignal.timeout(15000),
       }
-    } catch (err) {
-      console.warn("[analyze] GitHub Models error:", err);
+    );
+
+    if (!res.ok) {
+      console.error("[analyze] Gemini API error:", res.status, await res.text());
+      return base;
     }
-  }
 
-  // 3. Try Free Open-Source LLM (Pollinations AI)
-  try {
-    const res = await fetch("https://text.pollinations.ai/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messages: [{ role: "user", content: prompt }],
-        model: "openai",
-        seed: 42,
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
+    const data = await res.json();
+    const rawText: string =
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 
-    if (res.ok) {
-      const rawText = await res.text();
-      const parsed = parseJsonSafe(rawText);
-      if (parsed) return formatAiResult(parsed, "Open-Source AI Analysis");
-    }
-  } catch (err) {
-    console.warn("[analyze] Free LLM fallback error:", err);
-  }
-
-  return base;
-}
-
-function parseJsonSafe(rawText: string) {
-  try {
-    const clean = rawText
+    // Strip markdown code fences if present
+    const jsonText = rawText
       .replace(/^```json\s*/i, "")
       .replace(/^```\s*/i, "")
       .replace(/\s*```$/i, "")
       .trim();
-    return JSON.parse(clean);
-  } catch {
-    return null;
+
+    const parsed = JSON.parse(jsonText);
+
+    return {
+      name: "Gemini AI Analysis",
+      score: parsed.atsScore ?? 0,
+      matchedSkills: parsed.matchedSkills ?? [],
+      missingSkills: parsed.missingSkills ?? [],
+      suggestions: parsed.suggestions ?? [],
+      available: true,
+      roadmap: parsed.skillGapRoadmap ?? [],
+    };
+  } catch (err) {
+    console.error("[analyze] Gemini parse error:", err);
+    return base;
   }
 }
 
-function formatAiResult(parsed: any, name: string): EngineResult & { roadmap?: SkillGapItem[] } {
-  return {
-    name,
-    score: typeof parsed.atsScore === "number" ? parsed.atsScore : 82,
-    matchedSkills: Array.isArray(parsed.matchedSkills) ? parsed.matchedSkills : [],
-    missingSkills: Array.isArray(parsed.missingSkills) ? parsed.missingSkills : [],
-    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
-    available: true,
-    roadmap: Array.isArray(parsed.skillGapRoadmap) ? parsed.skillGapRoadmap : [],
-  };
-}
-
-// ─── Fallback roadmap from data.ts when AI is unavailable ───────────────────
+// ─── Fallback roadmap from data.ts when Gemini is unavailable ────────────────
 function buildFallbackRoadmap(missingSkills: string[], role: string): SkillGapItem[] {
   const LEARN_URLS: Record<string, string> = {
     react: "https://react.dev/learn",
@@ -292,10 +231,10 @@ export async function POST(req: NextRequest) {
     }
 
     // Run all 3 engines in parallel
-    const [heuristicRaw, githubRaw, aiRaw] = await Promise.allSettled([
+    const [heuristicRaw, githubRaw, geminiRaw] = await Promise.allSettled([
       Promise.resolve(analyzeResume(resumeText, role as RoleId)),
       runGithubEngine(role),
-      runMultiModelAiEngine(resumeText, role),
+      runGeminiEngine(resumeText, role),
     ]);
 
     const heuristic: EngineResult = {
@@ -311,11 +250,11 @@ export async function POST(req: NextRequest) {
         ? githubRaw.value
         : { name: "GitHub Market Demand", score: 0, matchedSkills: [], missingSkills: [], suggestions: [], available: false };
 
-    const aiResult =
-      aiRaw.status === "fulfilled"
-        ? aiRaw.value
-        : { name: "AI Analysis", score: 0, matchedSkills: [], missingSkills: [], suggestions: [], available: false, roadmap: [] };
-    const { roadmap: aiRoadmap, ...ai } = aiResult;
+    const geminiResult =
+      geminiRaw.status === "fulfilled"
+        ? geminiRaw.value
+        : { name: "Gemini AI Analysis", score: 0, matchedSkills: [], missingSkills: [], suggestions: [], available: false, roadmap: [] };
+    const { roadmap: geminiRoadmap, ...ai } = geminiResult;
 
     // Merge matched / missing skills (deduplicated union)
     const allMatched = [...new Set([...heuristic.matchedSkills, ...github.matchedSkills, ...(ai.matchedSkills ?? [])])];
@@ -334,8 +273,8 @@ export async function POST(req: NextRequest) {
 
     // Build skill gap roadmap
     const skillGapRoadmap: SkillGapItem[] =
-      ai.available && (aiRoadmap?.length ?? 0) > 0
-        ? (aiRoadmap as SkillGapItem[])
+      ai.available && (geminiRoadmap?.length ?? 0) > 0
+        ? (geminiRoadmap as SkillGapItem[])
         : buildFallbackRoadmap(allMissing, role);
 
     // Merge suggestions
