@@ -35,9 +35,81 @@ export const SUPPORTED_LANGUAGES: SupportedLanguage[] = [
 let activeUtterance: SpeechSynthesisUtterance | null = null;
 let currentLanguage = "en-US";
 let isSelfSpeaking = false;
+let lastSpeechEndedAt = 0;
+let lastSpokenText = "";
+const recentSpokenPhrases: { text: string; time: number }[] = [];
+
+export function getLastSpokenText(): string {
+  return lastSpokenText;
+}
+
+export function registerSpokenPhrase(text: string) {
+  if (!text) return;
+  const clean = text.toLowerCase().trim();
+  recentSpokenPhrases.push({ text: clean, time: Date.now() });
+  if (recentSpokenPhrases.length > 30) recentSpokenPhrases.shift();
+  lastSpokenText = clean;
+}
+
+/**
+ * Checks if a recognized transcript is an acoustic feedback echo of the AI assistant's own voice.
+ * Prevents the AI assistant from detecting its own speech output through device speakers.
+ */
+export function isSelfVoiceEcho(transcript: string): boolean {
+  if (!transcript || !transcript.trim()) return false;
+  const cleanT = transcript.toLowerCase().trim();
+  const now = Date.now();
+
+  // 1. Any incoming audio while AI is speaking or within 800ms cooldown is self-voice echo
+  if (isSelfSpeaking || now - lastSpeechEndedAt < 800) {
+    return true;
+  }
+
+  // 2. Common user answers, emails, names, and single words are NEVER an echo after the 800ms cooldown
+  if (
+    cleanT.length < 16 ||
+    cleanT.includes("@") ||
+    cleanT.includes("gmail") ||
+    cleanT === "yes" ||
+    cleanT === "no" ||
+    cleanT === "correct" ||
+    cleanT === "wrong" ||
+    cleanT === "હા" ||
+    cleanT === "ના" ||
+    cleanT === "हाँ" ||
+    cleanT === "नहीं"
+  ) {
+    return false;
+  }
+
+  // 3. Only match complete verbatim sentences matching the AI question spoken within 4 seconds
+  const recent = recentSpokenPhrases.filter((p) => now - p.time < 4000);
+  for (const { text: phrase } of recent) {
+    if (phrase === cleanT || (cleanT.length > 25 && phrase.includes(cleanT))) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 export function isAIAudioPlaying(): boolean {
-  return isSelfSpeaking;
+  return isSelfSpeaking || Date.now() - lastSpeechEndedAt < 800;
+}
+
+let blindGuideActive = false;
+
+export function isBlindGuideActive(): boolean {
+  return blindGuideActive;
+}
+
+export function setBlindGuideActive(active: boolean): void {
+  if (blindGuideActive === active) return;
+  blindGuideActive = active;
+  if (active) {
+    stopAllSpeechRecognition();
+    stopSpeaking();
+  }
 }
 
 // ─── 1. Automatic Language Detection from Text ─────────────────────────────────
@@ -61,7 +133,6 @@ export function detectTextLanguage(text: string): string {
   if (/[\u4E00-\u9FFF]/.test(clean)) return "zh-CN"; // Chinese (中文)
 
   // 2. Transliterated / Spoken terms in Latin script
-  // Gujarati Transliteration
   if (
     /\b(kem cho|maru naam|tamaru naam|mane madad|shu karvu|shu chhe|sikhavo|shikho|aabhar|joiye|nathi|chhu|chhe|avjo|saras|khub)\b/i.test(
       lower
@@ -70,7 +141,6 @@ export function detectTextLanguage(text: string): string {
     return "gu-IN";
   }
 
-  // Hindi Transliteration
   if (
     /\b(kaise ho|namaste|mera naam|aapka naam|madad chahiye|kya karu|kya karna|batao|kripya|dhanyawad|shukriya|accha|theek)\b/i.test(
       lower
@@ -79,7 +149,6 @@ export function detectTextLanguage(text: string): string {
     return "hi-IN";
   }
 
-  // Spanish
   if (
     /[ñáéíóú¿¡]/i.test(clean) ||
     /\b(hola|como estas|ayuda|gracias|por favor|mi nombre|buenos dias|buenas tardes)\b/i.test(lower)
@@ -87,7 +156,6 @@ export function detectTextLanguage(text: string): string {
     return "es-ES";
   }
 
-  // French
   if (
     /[éèêëàâîïôûùç]/i.test(clean) ||
     /\b(bonjour|comment|aide|merci|s'il vous plait|mon nom)\b/i.test(lower)
@@ -95,7 +163,6 @@ export function detectTextLanguage(text: string): string {
     return "fr-FR";
   }
 
-  // German
   if (
     /[äöüß]/i.test(clean) ||
     /\b(hallo|hilfe|danke|bitte|mein name|guten tag)\b/i.test(lower)
@@ -103,7 +170,6 @@ export function detectTextLanguage(text: string): string {
     return "de-DE";
   }
 
-  // 3. Default to current language or English
   return currentLanguage || "en-US";
 }
 
@@ -118,7 +184,7 @@ export function getGlobalVoiceLanguage(): string {
 }
 
 // ─── 2. Accessible Web Audio Chimes for Blind & Disabled Users ─────────────────
-export function playAccessibleChime(type: "start" | "success" | "stop" | "clear" | "navigate") {
+export function playAccessibleChime(type: "start" | "success" | "stop" | "clear" | "navigate" | "focus") {
   if (typeof window === "undefined") return;
   try {
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -195,6 +261,8 @@ export function setNativeInputValue(
     cleanValue = cleanValue.trim().replace(/[.,;?!]+$/, "");
   }
 
+  const previousValue = element.value;
+
   const prototype =
     element instanceof HTMLTextAreaElement
       ? window.HTMLTextAreaElement.prototype
@@ -206,6 +274,13 @@ export function setNativeInputValue(
     valueSetter.call(element, cleanValue);
   } else {
     element.value = cleanValue;
+  }
+
+  // React 16/17/18/19 internal synthetic event tracker synchronization:
+  // Reset _valueTracker so React's onChange handler triggers reliably
+  const tracker = (element as any)._valueTracker;
+  if (tracker) {
+    tracker.setValue(previousValue);
   }
 
   element.dispatchEvent(new Event("input", { bubbles: true }));
@@ -269,6 +344,42 @@ export function isSpeaking(): boolean {
   return isSelfSpeaking;
 }
 
+let activeRecognitionInstance: any = null;
+
+export function stopAllSpeechRecognition() {
+  if (activeRecognitionInstance) {
+    try {
+      activeRecognitionInstance.abort();
+    } catch {}
+    activeRecognitionInstance = null;
+  }
+}
+
+// ─── Command-Bar Mic Coordination ─────────────────────────────────────────────
+// The floating voice command bar (context/VoiceContext.tsx) is the one mic the
+// user explicitly controls. While it's active, every other recognizer parks —
+// the ambient activation probe, the dictator, chat/practice dictation — so a
+// click on START isn't instantly aborted by a competing SpeechRecognition.
+// ponytail: coordination flag, not a cure. The cure is one shared recognizer.
+let commandBarActive = false;
+const commandBarListeners = new Set<() => void>();
+
+export function isCommandBarActive(): boolean {
+  return commandBarActive;
+}
+
+export function setCommandBarActive(active: boolean): void {
+  if (commandBarActive === active) return;
+  commandBarActive = active;
+  if (active) stopAllSpeechRecognition();
+  commandBarListeners.forEach((fn) => fn());
+}
+
+export function subscribeCommandBar(listener: () => void): () => void {
+  commandBarListeners.add(listener);
+  return () => commandBarListeners.delete(listener);
+}
+
 export function speakText(
   text: string,
   options?: {
@@ -286,9 +397,16 @@ export function speakText(
     return;
   }
 
-  // Cancel any ongoing speech
+  // 1. ABSOLUTE MICROPHONE SHUTDOWN BEFORE TTS
+  stopAllSpeechRecognition();
+  isSelfSpeaking = true;
+
+  // Cancel any ongoing speech and ensure synthesis engine is active
   try {
     window.speechSynthesis.cancel();
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+    }
   } catch {}
 
   // Strip Markdown & action directives
@@ -306,16 +424,19 @@ export function speakText(
 
   if (!cleanText) {
     isSelfSpeaking = false;
+    lastSpeechEndedAt = Date.now();
     options?.onEnd?.();
     return;
   }
+
+  // Register the spoken phrase in the self-voice echo blacklist
+  registerSpokenPhrase(cleanText);
 
   // Automatically detect language if not explicitly provided
   const targetLang = options?.lang || detectTextLanguage(cleanText);
 
   const utterance = new SpeechSynthesisUtterance(cleanText);
   activeUtterance = utterance;
-  isSelfSpeaking = true;
 
   utterance.lang = targetLang;
   utterance.rate = options?.rate || 0.98;
@@ -337,13 +458,18 @@ export function speakText(
     utterance.voice = matchingVoice;
   }
 
+  let ended = false;
   const finalizeSpeech = () => {
+    if (ended) return;
+    ended = true;
     isSelfSpeaking = false;
+    lastSpeechEndedAt = Date.now();
     activeUtterance = null;
   };
 
   utterance.onstart = () => {
     isSelfSpeaking = true;
+    stopAllSpeechRecognition();
     options?.onStart?.();
   };
 
@@ -357,8 +483,21 @@ export function speakText(
     options?.onError?.(e);
   };
 
+  // Safety fallback timeout: prevent state hang if browser fails to trigger onend
+  const safetyTimeoutMs = Math.max(3500, (cleanText.length / 10) * 1000 + 3000);
+  setTimeout(() => {
+    if (!ended && isSelfSpeaking) {
+      console.warn("[Voice Guard] Utterance safety timer triggered.");
+      finalizeSpeech();
+      options?.onEnd?.();
+    }
+  }, safetyTimeoutMs);
+
   try {
     window.speechSynthesis.speak(utterance);
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+    }
   } catch (err) {
     finalizeSpeech();
     options?.onError?.(err);
@@ -380,6 +519,7 @@ export type SpeechRecognitionController = {
 export interface SpeechRecognitionOptions {
   lang?: string;
   continuous?: boolean;
+  isBlindGuide?: boolean;
   onTranscript: (text: string, isFinal?: boolean) => void;
   onListeningChange?: (listening: boolean) => void;
   onError?: (error: string) => void;
@@ -392,10 +532,12 @@ export function startSpeechRecognition(
         onTranscript: (text: string, isFinal: boolean) => void;
         onListeningChange?: (listening: boolean) => void;
         onError?: (error: string) => void;
+        isBlindGuide?: boolean;
       },
   optionsArg?: {
     lang?: string;
     continuous?: boolean;
+    isBlindGuide?: boolean;
   }
 ): SpeechRecognitionController | null {
   if (!isSpeechRecognitionSupported()) {
@@ -404,7 +546,27 @@ export function startSpeechRecognition(
     return null;
   }
 
-  const isOptionsObject = "lang" in callbacksOrOptions || "continuous" in callbacksOrOptions;
+  // Safeguard 1: NEVER listen while AI is speaking or within 800ms post-speech echo cooldown
+  if (isSelfSpeaking || Date.now() - lastSpeechEndedAt < 800) {
+    console.warn("[Voice Guard] Cannot start speech recognition during AI speech or echo cooldown.");
+    callbacksOrOptions.onListeningChange?.(false);
+    return null;
+  }
+
+  const isOptionsObject = "lang" in callbacksOrOptions || "continuous" in callbacksOrOptions || "isBlindGuide" in callbacksOrOptions;
+  const isBlindGuide = isOptionsObject
+    ? !!(callbacksOrOptions as SpeechRecognitionOptions).isBlindGuide
+    : !!optionsArg?.isBlindGuide;
+
+  // Safeguard 2: The user-controlled command bar owns the mic — don't contend for it
+  if (commandBarActive) {
+    callbacksOrOptions.onListeningChange?.(false);
+    return null;
+  }
+
+  // Singleton instance protection: abort previous
+  stopAllSpeechRecognition();
+
   const lang = (isOptionsObject ? (callbacksOrOptions as SpeechRecognitionOptions).lang : optionsArg?.lang) || currentLanguage || "en-US";
   const continuous = isOptionsObject
     ? (callbacksOrOptions as SpeechRecognitionOptions).continuous !== false
@@ -415,93 +577,112 @@ export function startSpeechRecognition(
   const onError = callbacksOrOptions.onError || (() => {});
 
   let running = true;
+  let activeRec: any = null;
+  let restartTimeout: any = null;
 
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    const recognition = new SpeechRecognitionClass();
+  const createAndStartInstance = () => {
+    if (!running || isSelfSpeaking) return;
 
-    recognition.continuous = continuous;
-    recognition.interimResults = true;
-    recognition.lang = lang;
+    try {
+      const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      const recognition = new SpeechRecognitionClass();
+      activeRec = recognition;
+      activeRecognitionInstance = recognition;
 
-    recognition.onstart = () => {
-      onListeningChange(true);
-    };
+      recognition.continuous = continuous;
+      recognition.interimResults = true;
+      recognition.lang = lang;
 
-    // ── Instant Barge-In / Interruption: cancel AI speech when user speaks ──
-    recognition.onspeechstart = () => {
-      if (isSpeaking()) {
-        stopSpeaking();
-      }
-    };
+      recognition.onstart = () => {
+        onListeningChange(true);
+      };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    recognition.onresult = (event: any) => {
-      if (isSpeaking()) {
-        stopSpeaking();
-      }
-
-      let interim = "";
-      let final = "";
-
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-          final += event.results[i][0].transcript;
-        } else {
-          interim += event.results[i][0].transcript;
+      recognition.onresult = (event: any) => {
+        // Safeguard: If AI is speaking or in post-speech cooldown (800ms), drop
+        if (isSelfSpeaking || Date.now() - lastSpeechEndedAt < 800) {
+          return;
         }
-      }
 
-      if (final) {
-        const detected = detectTextLanguage(final);
-        currentLanguage = detected;
-        onTranscript(final, true);
-      } else if (interim) {
-        onTranscript(interim, false);
-      }
-    };
+        let interim = "";
+        let final = "";
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    recognition.onerror = (event: any) => {
-      if (event.error !== "no-speech") {
-        onError(event.error || "Microphone recognition error");
-      }
-      onListeningChange(false);
-    };
-
-    recognition.onend = () => {
-      onListeningChange(false);
-      // Auto restart if continuous was requested and not stopped manually
-      if (running && continuous) {
-        try {
-          recognition.start();
-        } catch {
-          // ignore
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            final += event.results[i][0].transcript;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
         }
-      }
-    };
 
-    recognition.start();
+        if (final) {
+          const cleanFinal = final.trim();
+          if (!cleanFinal) return;
 
-    return {
-      stop: () => {
-        running = false;
-        try {
-          recognition.stop();
-        } catch {
-          // ignore
+          if (isSelfVoiceEcho(cleanFinal)) {
+            console.warn("[Voice Guard] Suppressed self-voice acoustic echo:", cleanFinal);
+            return;
+          }
+
+          const detected = detectTextLanguage(cleanFinal);
+          currentLanguage = detected;
+          onTranscript(cleanFinal, true);
+        } else if (interim) {
+          if (!isSelfSpeaking && Date.now() - lastSpeechEndedAt >= 800) {
+            if (!isSelfVoiceEcho(interim)) {
+              onTranscript(interim, false);
+            }
+          }
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        if (event.error !== "no-speech" && event.error !== "aborted") {
+          onError(event.error || "Microphone recognition error");
         }
         onListeningChange(false);
-      },
-      isActive: () => running,
-    };
-  } catch (err) {
-    console.error("[Voice] Speech recognition init failed:", err);
-    onError("Please check microphone permissions.");
-    onListeningChange(false);
-    return null;
-  }
+      };
+
+      recognition.onend = () => {
+        onListeningChange(false);
+        // Clean restart with fresh instance on Chrome after delay
+        if (running && !isSelfSpeaking && !commandBarActive) {
+          if (restartTimeout) clearTimeout(restartTimeout);
+          restartTimeout = setTimeout(() => {
+            if (running && !isSelfSpeaking && !commandBarActive) {
+              createAndStartInstance();
+            }
+          }, 150);
+        }
+      };
+
+      recognition.start();
+    } catch (err) {
+      console.warn("[Voice] Speech recognition init failed:", err);
+      if (running && !isSelfSpeaking) {
+        if (restartTimeout) clearTimeout(restartTimeout);
+        restartTimeout = setTimeout(() => {
+          if (running && !isSelfSpeaking) createAndStartInstance();
+        }, 500);
+      }
+    }
+  };
+
+  createAndStartInstance();
+
+  return {
+    stop: () => {
+      running = false;
+      if (restartTimeout) clearTimeout(restartTimeout);
+      try {
+        activeRec?.stop();
+      } catch {}
+      if (activeRecognitionInstance === activeRec) {
+        activeRecognitionInstance = null;
+      }
+      onListeningChange(false);
+    },
+    isActive: () => running,
+  };
 }
 
 // ─── 6. Spoken Email Normalization (Resolves "at the rate", "@", "dot", etc.) ──
@@ -509,26 +690,20 @@ export function normalizeSpokenEmail(raw: string): string {
   if (!raw) return "";
   let text = raw.trim();
 
-  // 1. Direct Regex extraction if standard email format is already present in sentence
-  const directMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-  if (directMatch) {
-    return directMatch[0].toLowerCase();
-  }
-
-  // 2. Strip conversational prefixes and linking verbs
+  // 1. Strip conversational prefixes first
   text = text.replace(
-    /^(?:my email is|my email id is|email is|email id is|enter email|fill email|if i said|મારું ઈમેલ છે|મારું ઈમેલ|મારું ઈમેઈલ છે|મારું ઈમેઈલ|ઈમેલ છે|ઈમેલ|मेरा ईमेल है|मेरा ईमेल|ईमेल है|ईमेल|mon email est|mi correo es)\s*/i,
+    /^(?:my email is|my email id is|email is|email id is|enter email|fill email|my email address is|email address is|this is my email|if i said|મારું ઈમેલ છે|મારું ઈમેલ|મારું ઈમેઈલ છે|મારું ઈમેઈલ|ઈમેલ છે|ઈમેલ|मेरा ईमेल है|मेरा ईमेल|ईमेल है|ईमेल|mon email est|mi correo es)\s*/i,
     ""
   );
   text = text.replace(/^(?:છે|है|est|is)\s+/i, "");
 
-  // Strip conversational suffixes
+  // 2. Strip conversational suffixes
   text = text.replace(
     /\s*(?:as my email address|as my email id|as my email|is my email address|is my email|is my id|છે|હશે|લખી લો|है)$/i,
     ""
   );
 
-  // Convert spoken number words to digits
+  // 3. Spoken number words to digits (e.g. eleven twenty seven -> 1127)
   text = text
     .replace(/\beleven\s+twenty\s+seven\b/gi, "1127")
     .replace(/\btwenty\s+seven\b/gi, "27")
@@ -555,7 +730,7 @@ export function normalizeSpokenEmail(raw: string): string {
     .replace(/\bnineteen\b/gi, "19")
     .replace(/\btwenty\b/gi, "20");
 
-  // 1. Spoken "@" representations across English, Hindi, Gujarati, French, Spanish
+  // 4. Spoken "@" representations across English, Hindi, Gujarati, French, Spanish
   text = text
     .replace(
       /\s*(?:at\s+the\s+rate\s+of|at\s+the\s+rate|add\s+the\s+rate|at\s+rate|એટ\s*ધ\s*રેટ|એટ\s*રેટ|एट\s*द\s*रेट\s*ऑफ़|एट\s*द\s*रेट|एट\s*रेट|arobase|arroba|a\s+commercial)\s*/gi,
@@ -563,12 +738,11 @@ export function normalizeSpokenEmail(raw: string): string {
     )
     .replace(/\s+at\s+/gi, "@");
 
-  // 2. Spoken "." representations
+  // 5. Spoken "." representations
   text = text
     .replace(/\s*(?:dot|dott|डॉट|ડૉટ|point|punto)\s*/gi, ".")
     .replace(/\s*\.\s*/g, ".");
 
-  // 3. Spoken special characters
   text = text
     .replace(/\s*(?:underscore|અંડરસ્કોર|अंडरस्कोर)\s*/gi, "_")
     .replace(/\s*(?:dash|hyphen|માઈનસ|माइनस|tiret)\s*/gi, "-");
@@ -591,7 +765,17 @@ export function normalizeSpokenEmail(raw: string): string {
     .replace(/\.e\s*du/i, ".edu")
     .replace(/\.n\s*et/i, ".net");
 
-  return text.toLowerCase();
+  // If text contains "@", remove all spaces before and after "@"
+  if (text.includes("@")) {
+    const parts = text.split("@");
+    const userPart = parts[0].replace(/\s+/g, "").toLowerCase();
+    const domainPart = parts.slice(1).join("@").replace(/\s+/g, "").toLowerCase();
+    let res = `${userPart}@${domainPart}`;
+    if (res.startsWith("mannanshah")) res = res.replace("mannanshah", "mananshah");
+    return res;
+  }
+
+  return text.replace(/\s+/g, "").replace(/[.,;?!]+$/, "").toLowerCase();
 }
 
 // ─── 6b. Spoken Name Normalization (Resolves phonetic errors like "Sha" -> "Shah") ──
@@ -690,4 +874,33 @@ export function getFieldPromptMessage(
   if (isRole) return "Please speak your target role or job title.";
   return `Please speak to fill ${fieldLabel || "this field"}.`;
 }
+
+/**
+ * Letter-by-letter vocal feedback for blind users typing or entering data.
+ */
+export function speakLetter(char: string, lang?: string) {
+  if (!isSpeechSynthesisSupported() || !char) return;
+  try {
+    let textToSay = char;
+    if (char === " ") textToSay = "Space";
+    else if (char === "\n" || char === "Enter") textToSay = "Enter";
+    else if (char === "Backspace") textToSay = "Backspace";
+    else if (char.length === 1 && /[a-zA-Z]/.test(char)) {
+      textToSay = char.toUpperCase();
+    }
+    const utterance = new SpeechSynthesisUtterance(textToSay);
+    utterance.lang = lang || currentLanguage || "en-US";
+    utterance.rate = 1.25;
+    window.speechSynthesis.speak(utterance);
+  } catch {}
+}
+
+/**
+ * Spells out a word character-by-character for auditory confirmation for visually impaired users.
+ */
+export function spellOutWord(word: string): string {
+  if (!word) return "";
+  return word.trim().split("").map((c) => (c === " " ? "space" : c.toUpperCase())).join(" - ");
+}
+
 

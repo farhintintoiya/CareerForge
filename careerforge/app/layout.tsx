@@ -4,6 +4,7 @@ import "./globals.css";
 import { AppProvider } from "@/lib/store";
 import { GlobalVoiceDictator } from "@/components/accessibility/GlobalVoiceDictator";
 import { GlobalVoiceProvider } from "@/providers/GlobalVoiceProvider";
+import { VoiceProvider } from "@/context/VoiceContext";
 
 const display = Newsreader({
   subsets: ["latin"],
@@ -36,8 +37,10 @@ export default function RootLayout({
       <body className="font-body antialiased">
         <AppProvider>
           <GlobalVoiceProvider>
-            {children}
-            <GlobalVoiceDictator />
+            <VoiceProvider>
+              {children}
+              <GlobalVoiceDictator />
+            </VoiceProvider>
           </GlobalVoiceProvider>
         </AppProvider>
       </body>

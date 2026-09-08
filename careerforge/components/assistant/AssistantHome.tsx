@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useRef, useState, useEffect, ChangeEvent } from "react";
+import { FormEvent, useRef, useState, useEffect, ChangeEvent, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
 import { useApp } from "@/lib/store";
 import { FeatureId, ResumeTab, ParsedIntent } from "@/lib/intent";
 import {
@@ -12,6 +13,14 @@ import {
   normalizeSpokenEmail,
   detectTextLanguage,
 } from "@/lib/voice";
+import { LANGUAGE_LIST, getSupportedLanguage } from "@/lib/speech/languages";
+import { SpeechProviderType, QuestionState, ExpectedAnswerType, VoiceState, AnswerType } from "@/lib/speech/types";
+import {
+  validateUserAnswer,
+  getQuestionRetryPrompt,
+  getFallbackMessage,
+} from "@/lib/speech/questionFlow";
+import { extractAnswerFromTranscript } from "@/lib/speech/answerExtractor";
 import { getResumeStepPrompt } from "@/lib/conversationalResume";
 import { ShareModal } from "./ShareModal";
 
@@ -24,6 +33,7 @@ export type Msg = {
   intent?: ParsedIntent;
   redirecting?: boolean;
   engine?: string;
+  thinking?: string[];
 };
 
 export interface Conversation {
@@ -36,18 +46,73 @@ export interface Conversation {
   archived?: boolean;
 }
 
+function ThinkingProcess({ steps }: { steps: string[] }) {
+  const [open, setOpen] = useState(false);
+
+  if (!steps || steps.length === 0) return null;
+
+  return (
+    <div className="mb-2 w-full">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="group inline-flex items-center gap-2 rounded-full border border-line/80 bg-paper/80 px-3 py-1 text-xs font-medium text-graphite hover:bg-mist hover:text-ink transition-all cursor-pointer shadow-2xs"
+        aria-expanded={open}
+        aria-label="Toggle thinking process"
+      >
+        <span className="flex h-2 w-2 rounded-full bg-accent animate-pulse" />
+        <span className="flex items-center gap-1">
+          <span className="text-accent font-semibold">Thought</span>
+          <span className="text-graphite/40">·</span>
+          <span>{steps.length} reasoning steps</span>
+        </span>
+        <svg
+          className={`w-3.5 h-3.5 text-graphite/60 transition-transform duration-200 ${
+            open ? "rotate-180" : ""
+          }`}
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="mt-2 space-y-1.5 rounded-xl border border-line/70 bg-paper/60 p-3 text-xs text-graphite shadow-2xs animate-in fade-in slide-in-from-top-1 duration-150">
+          <div className="flex items-center justify-between pb-1 border-b border-line/40 text-[10px] font-semibold text-graphite/60 uppercase tracking-wider">
+            <span>Deliberative Reasoning Process</span>
+            <span className="text-accent/90 font-normal normal-case">Claude & ChatGPT Paradigm</span>
+          </div>
+          <div className="space-y-1.5 pt-1">
+            {steps.map((step, idx) => (
+              <div
+                key={idx}
+                className="flex items-start gap-2 rounded-lg bg-white/80 px-2.5 py-1.5 border border-line/40 text-graphite text-[11px] leading-relaxed"
+              >
+                <span className="text-accent font-bold select-none shrink-0">•</span>
+                <span>{step}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const STORAGE_KEY = "careerforge.conversations";
 
-// Clean prompt pills matching Photo 3
+// Starter prompts, grouped so the rail reads as a table of contents, not a toolbar
 const quickPills = [
-  { label: "🗺️ Check Roadmap", prompt: "Show me my complete career roadmap" },
-  { label: "📚 Top Courses", prompt: "Recommend the best free & curated courses for my role" },
-  { label: "🎯 Mock Interview", prompt: "I want to practice interview questions" },
-  { label: "📄 ATS Resume Audit", prompt: "Help me audit my resume for ATS compliance" },
-  { label: "📍 Local Tech Jobs", prompt: "Show local and remote jobs matching my target profile" },
-  { label: "💼 2026 Salary Trends", prompt: "What are the latest 2026 salary trends for my role?" },
-  { label: "🧠 Behavioral (STAR)", prompt: "Help me frame my past experience using the STAR method" },
-  { label: "🚀 Portfolio Projects", prompt: "Give me standout production project ideas for my portfolio" },
+  { label: "Review my roadmap", prompt: "Show me my complete career roadmap" },
+  { label: "Find courses for my role", prompt: "Recommend the best free & curated courses for my role" },
+  { label: "Run a mock interview", prompt: "I want to practice interview questions" },
+  { label: "Audit my resume for ATS", prompt: "Help me audit my resume for ATS compliance" },
+  { label: "Jobs near me", prompt: "Show local and remote jobs matching my target profile" },
+  { label: "2026 salary trends", prompt: "What are the latest 2026 salary trends for my role?" },
+  { label: "Frame my experience with STAR", prompt: "Help me frame my past experience using the STAR method" },
+  { label: "Portfolio project ideas", prompt: "Give me standout production project ideas for my portfolio" },
 ];
 
 export function AssistantHome({
@@ -60,6 +125,10 @@ export function AssistantHome({
     setTargetRole,
     voiceMode,
     setVoiceMode,
+    voiceLanguage,
+    setVoiceLanguage,
+    speechProvider,
+    setSpeechProvider,
     accessibilityPrefs,
     setAccessibilityPrefs,
     currentLocation,
@@ -86,8 +155,12 @@ export function AssistantHome({
   // ─── Voice & Silence Detection State ───────────────────────────────────────
   const [listening, setListening] = useState(false);
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  const [liveSpokenText, setLiveSpokenText] = useState<string | null>(null);
+  const [lastAssistantReply, setLastAssistantReply] = useState<string | null>(null);
   const [micError, setMicError] = useState<string | null>(null);
   const [silenceCountdown, setSilenceCountdown] = useState<number | null>(null);
+  const [activeQuestion, setActiveQuestion] = useState<QuestionState | null>(null);
+  const [textFallbackActive, setTextFallbackActive] = useState(false);
 
   // Share & Toast State
   const [shareModalOpen, setShareModalOpen] = useState(false);
@@ -97,7 +170,10 @@ export function AssistantHome({
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(true);
 
-  // Refs
+  // Refs for Real-Time Audio Synchronization & Guarding
+  const isAISpeakingRef = useRef(false);
+  const activeQuestionRef = useRef<QuestionState | null>(null);
+  activeQuestionRef.current = activeQuestion;
   const speechControllerRef = useRef<SpeechRecognitionController | null>(null);
   const speechBaseTextRef = useRef<string>("");
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -108,8 +184,17 @@ export function AssistantHome({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputRef = useRef(input);
   inputRef.current = input;
+  const runPromptRef = useRef<(prompt: string) => void>(() => {});
   const [voiceLang, setVoiceLang] = useState<string>("auto");
   const wasVoiceActiveOnHideRef = useRef(false);
+
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 3200);
+  };
 
   // Cleanup timers & speech on unmount
   useEffect(() => {
@@ -121,97 +206,8 @@ export function AssistantHome({
     };
   }, []);
 
-  // ─── Tab-Switch / Minimize Auto-Pause & Resume with Direct Question ──────────
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        // Tab switched / minimized: pause voice detection temporarily
-        if (listening || voiceMode) {
-          wasVoiceActiveOnHideRef.current = true;
-          stopListening();
-          stopSpeaking();
-        }
-      } else {
-        // Tab restored / visible: resume voice detection & directly ask question
-        if (wasVoiceActiveOnHideRef.current || voiceMode) {
-          wasVoiceActiveOnHideRef.current = false;
-
-          let promptToSpeak = "";
-          const isGu = voiceLang.startsWith("gu");
-          const isHi = voiceLang.startsWith("hi");
-          const isFr = voiceLang.startsWith("fr");
-
-          if (resumeDraftState && !resumeDraftState.completed && resumeDraftState.step) {
-            const stepQ = getResumeStepPrompt(resumeDraftState.step, voiceLang);
-            promptToSpeak = isGu
-              ? `પાછા સ્વાગત છે! ચાલો આગળ વધીએ. ${stepQ}`
-              : isHi
-              ? `वापसी पर स्वागत है! आइए आगे बढ़ें। ${stepQ}`
-              : isFr
-              ? `Bon retour ! Continuons. ${stepQ}`
-              : `Welcome back! Let's continue. ${stepQ}`;
-          } else {
-            promptToSpeak = isGu
-              ? `પાછા સ્વાગત છે! હું તમારો અવાજ સાંભળવા તૈયાર છું. તમે ક્યાંથી શરૂ કરવા માંગો છો?`
-              : isHi
-              ? `वापसी पर स्वागत है! मैं आपकी आवाज़ सुनने के लिए तैयार हूँ। आप कहाँ से शुरुआत करना चाहेंगे?`
-              : isFr
-              ? `Bon retour ! Je vous écoute. Comment puis-je vous aider aujourd'hui ?`
-              : `Welcome back! I am listening. How can I help you continue?`;
-          }
-
-          if (accessibilityPrefs?.speechOutput !== false) {
-            speakText(promptToSpeak, {
-              lang: voiceLang !== "auto" ? voiceLang : "en-US",
-              onEnd: () => {
-                startListening();
-              },
-            });
-          } else {
-            startListening();
-          }
-        }
-      }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [listening, voiceMode, voiceLang, resumeDraftState, accessibilityPrefs, startListening, stopListening]);
-
-  // Update horizontal prompt scroll buttons
-  const checkPromptScroll = () => {
-    if (promptScrollRef.current) {
-      const { scrollLeft, scrollWidth, clientWidth } = promptScrollRef.current;
-      setCanScrollLeft(scrollLeft > 4);
-      setCanScrollRight(scrollLeft < scrollWidth - clientWidth - 4);
-    }
-  };
-
-  useEffect(() => {
-    checkPromptScroll();
-    window.addEventListener("resize", checkPromptScroll);
-    return () => window.removeEventListener("resize", checkPromptScroll);
-  }, []);
-
-  const scrollPrompts = (direction: "left" | "right") => {
-    if (promptScrollRef.current) {
-      const offset = direction === "left" ? -280 : 280;
-      promptScrollRef.current.scrollBy({ left: offset, behavior: "smooth" });
-      setTimeout(checkPromptScroll, 320);
-    }
-  };
-
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => {
-      setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 3200);
-  };
-
   // ─── Voice Recognition with 3.5s Silence Auto-Send ─────────────────────────
-  const clearSilenceTimers = () => {
+  const clearSilenceTimers = useCallback(() => {
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
@@ -221,9 +217,15 @@ export function AssistantHome({
       silenceCountdownIntervalRef.current = null;
     }
     setSilenceCountdown(null);
-  };
+  }, []);
 
-  const startSilenceAutoSendCountdown = () => {
+  const stopListening = useCallback(() => {
+    clearSilenceTimers();
+    speechControllerRef.current?.stop();
+    setListening(false);
+  }, [clearSilenceTimers]);
+
+  const startSilenceAutoSendCountdown = useCallback(() => {
     clearSilenceTimers();
 
     let timeLeft = 3.5;
@@ -249,41 +251,60 @@ export function AssistantHome({
       const textToSend = inputRef.current.trim();
       if (textToSend) {
         setInput("");
-        runPrompt(textToSend);
+        inputRef.current = "";
+        runPromptRef.current(textToSend);
       }
     }, 3500);
-  };
+  }, [clearSilenceTimers]);
 
-  const stopListening = () => {
-    clearSilenceTimers();
-    speechControllerRef.current?.stop();
-    setListening(false);
-  };
+  const startListening = useCallback(() => {
+    if (isAISpeakingRef.current || speakingMsgId || textFallbackActive) {
+      console.warn("[Voice Guard] Cannot start listening while AI is speaking or in text fallback mode.");
+      return;
+    }
 
-  const startListening = () => {
     setMicError(null);
     clearSilenceTimers();
-    speechBaseTextRef.current = input.trim();
 
     const controller = startSpeechRecognition({
-      lang: voiceLang,
-      onTranscript: (transcript: string) => {
+      lang: voiceLanguage !== "auto" ? voiceLanguage : "en-US",
+      onTranscript: (transcript: string, isFinal?: boolean) => {
         if (transcript) {
-          let processed = transcript;
-          if (
-            transcript.includes("@") ||
-            transcript.toLowerCase().includes("at the rate") ||
-            transcript.toLowerCase().includes("at rate") ||
-            transcript.toLowerCase().includes("gmail") ||
-            transcript.toLowerCase().includes(".com")
-          ) {
-            processed = normalizeSpokenEmail(transcript);
+          // Detect spoken language if auto mode is enabled
+          const detected = detectTextLanguage(transcript);
+          if (detected && voiceLanguage === "auto" && detected !== voiceLang) {
+            setVoiceLang(detected);
           }
-          const base = speechBaseTextRef.current;
-          const combined = base ? `${base} ${processed}` : processed;
-          setInput(combined);
-          inputRef.current = combined;
-          startSilenceAutoSendCountdown();
+
+          // ── Verbal Barge-In Interruption Check ──
+          const lower = transcript.toLowerCase().trim();
+          if (
+            lower === "stop" ||
+            lower === "wait" ||
+            lower === "pause" ||
+            lower === "રોકો" ||
+            lower === "रुको" ||
+            lower === "arrête"
+          ) {
+            stopAllVoice();
+            return;
+          }
+
+          // ── Extract the Actual Clean Answer based on Question Type ──
+          const currentQ = activeQuestionRef.current;
+          const targetType = currentQ?.answerType || currentQ?.expectedType || "free_text";
+          const langForExtraction = voiceLanguage !== "auto" ? voiceLanguage : detected || "en";
+
+          const extraction = extractAnswerFromTranscript(transcript, targetType, langForExtraction);
+          const cleanAnswer = extraction.extractedAnswer || transcript.trim();
+
+          // ── Put ONLY the Extracted Clean Answer into Existing Input Box ──
+          setInput(cleanAnswer);
+          inputRef.current = cleanAnswer;
+
+          if (isFinal) {
+            startSilenceAutoSendCountdown();
+          }
         }
       },
       onListeningChange: (isList: boolean) => {
@@ -298,28 +319,107 @@ export function AssistantHome({
     });
 
     speechControllerRef.current = controller;
-  };
+  }, [clearSilenceTimers, speakingMsgId, startSilenceAutoSendCountdown, textFallbackActive, voiceLang, voiceLanguage]);
 
-  const toggleListening = () => {
+  const toggleListening = useCallback(() => {
     if (listening) {
       stopListening();
     } else {
       startListening();
     }
+  }, [listening, startListening, stopListening]);
+
+  // ─── Tab-Switch / Minimize Auto-Pause & Resume with Direct Question ──────────
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        // Tab switched / minimized: pause voice detection temporarily
+        if (listening || voiceMode) {
+          wasVoiceActiveOnHideRef.current = true;
+          stopListening();
+          stopSpeaking();
+        }
+      } else {
+        // Tab restored / visible: resume voice detection & directly ask question
+        if (wasVoiceActiveOnHideRef.current && voiceMode) {
+          wasVoiceActiveOnHideRef.current = false;
+          let promptToSpeak = "Welcome back! How can I help you continue?";
+          if (resumeDraftState && !resumeDraftState.completed && resumeDraftState.step) {
+            promptToSpeak = getResumeStepPrompt(resumeDraftState.step, voiceLang);
+          }
+
+          if (accessibilityPrefs?.speechOutput !== false) {
+            speakText(promptToSpeak, {
+              lang: voiceLang !== "auto" ? voiceLang : "en-US",
+              onEnd: () => {
+                startListening();
+              },
+            });
+          } else {
+            startListening();
+          }
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [listening, voiceMode, voiceLang, resumeDraftState, accessibilityPrefs, startListening, stopListening]);
+
+  const stopAllVoice = () => {
+    stopSpeaking();
+    stopListening();
+    setSpeakingMsgId(null);
+    setLiveSpokenText(null);
   };
 
   const toggleSpeech = (msgId: string, text: string) => {
     if (speakingMsgId === msgId) {
       stopSpeaking();
       setSpeakingMsgId(null);
+      setLiveSpokenText(null);
       return;
     }
     stopSpeaking();
     setSpeakingMsgId(msgId);
+    setLiveSpokenText(text);
+    setLastAssistantReply(text);
     speakText(text, {
-      onEnd: () => setSpeakingMsgId(null),
-      onError: () => setSpeakingMsgId(null),
+      lang: voiceLanguage !== "auto" ? voiceLanguage : detectTextLanguage(text),
+      onEnd: () => {
+        setSpeakingMsgId(null);
+        setLiveSpokenText(null);
+      },
+      onError: () => {
+        setSpeakingMsgId(null);
+        setLiveSpokenText(null);
+      },
     });
+  };
+
+  const repeatLastResponse = () => {
+    const textToRepeat =
+      lastAssistantReply ||
+      messages
+        .slice()
+        .reverse()
+        .find((m) => m.role === "assistant")?.text;
+
+    if (textToRepeat) {
+      toggleSpeech(`repeat-${Date.now()}`, textToRepeat);
+    }
+  };
+
+  const toggleMute = () => {
+    const nextSpeech = !accessibilityPrefs.speechOutput;
+    setAccessibilityPrefs({ speechOutput: nextSpeech });
+    if (!nextSpeech) {
+      stopSpeaking();
+      setSpeakingMsgId(null);
+      setLiveSpokenText(null);
+    }
   };
 
   const userDisplayName = user?.name
@@ -327,6 +427,28 @@ export function AssistantHome({
     : user?.email
     ? user.email.split("@")[0]
     : "there";
+
+  const checkPromptScroll = () => {
+    if (promptScrollRef.current) {
+      const { scrollLeft, scrollWidth, clientWidth } = promptScrollRef.current;
+      setCanScrollLeft(scrollLeft > 4);
+      setCanScrollRight(scrollLeft < scrollWidth - clientWidth - 4);
+    }
+  };
+
+  useEffect(() => {
+    checkPromptScroll();
+    window.addEventListener("resize", checkPromptScroll);
+    return () => window.removeEventListener("resize", checkPromptScroll);
+  }, []);
+
+  const scrollPrompts = (direction: "left" | "right") => {
+    if (promptScrollRef.current) {
+      const offset = direction === "left" ? -280 : 280;
+      promptScrollRef.current.scrollBy({ left: offset, behavior: "smooth" });
+      setTimeout(checkPromptScroll, 320);
+    }
+  };
 
   // ─── 1. Load Conversations from LocalStorage ────────────────────────────────
   useEffect(() => {
@@ -415,16 +537,51 @@ export function AssistantHome({
     }
   };
 
-  const deleteConversation = (convId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const clearAllConversations = () => {
+    if (typeof window !== "undefined" && !window.confirm("Are you sure you want to delete all chat history? This cannot be undone.")) {
+      return;
+    }
+    const cleanId = `conv-${Date.now()}`;
+    const freshConv: Conversation = {
+      id: cleanId,
+      title: "New Career Chat",
+      messages: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      pinned: false,
+      archived: false,
+    };
+    saveConversations([freshConv]);
+    setActiveConvId(cleanId);
+    setInput("");
+    setAttachedFile(null);
+    clearSilenceTimers();
+    showToast("All chat history deleted");
+  };
+
+  const deleteConversation = (convId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
     const filtered = conversations.filter((c) => c.id !== convId);
     if (filtered.length === 0) {
-      createNewConversation();
+      const cleanId = `conv-${Date.now()}`;
+      const freshConv: Conversation = {
+        id: cleanId,
+        title: "New Career Chat",
+        messages: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        pinned: false,
+        archived: false,
+      };
+      saveConversations([freshConv]);
+      setActiveConvId(cleanId);
+      showToast("Chat deleted. Started clean chat.");
     } else {
       saveConversations(filtered);
       if (convId === activeConvId) {
         setActiveConvId(filtered[0].id);
       }
+      showToast("Chat deleted");
     }
   };
 
@@ -493,7 +650,7 @@ export function AssistantHome({
     onRedirect(feature, tab);
   };
 
-  // ─── 7. Send Prompt via Backend ─────────────────────────────────────────────
+  // ─── 7. Send Prompt via Backend & Question Turn Engine ─────────────────────
   const runPrompt = async (prompt: string) => {
     if ((!prompt.trim() && !attachedFile) || busy || !activeConversation) return;
     clearSilenceTimers();
@@ -503,6 +660,171 @@ export function AssistantHome({
     const userMsgId = `user-${Date.now()}`;
     const userMsgText = prompt.trim();
     const docInfo = attachedFile;
+
+    // ── Turn-Taking Question Validation & 3-Attempt Fallback ──
+    const currentQ = activeQuestionRef.current;
+    if (currentQ && !currentQ.answered && userMsgText) {
+      const valResult = validateUserAnswer(
+        userMsgText,
+        currentQ.expectedType,
+        voiceLanguage !== "auto" ? voiceLanguage : "en"
+      );
+
+      if (!valResult.valid) {
+        currentQ.attempts += 1;
+        setActiveQuestion({ ...currentQ });
+        activeQuestionRef.current = { ...currentQ };
+
+        if (currentQ.attempts >= 3) {
+          // ── 3-ATTEMPT RULE: AUTOMATIC TEXT FALLBACK ──
+          console.log(`[VOICE FALLBACK] 3 failed attempts on question ${currentQ.id}. Switching to text.`);
+          setTextFallbackActive(true);
+          setVoiceMode(false);
+          setAccessibilityPrefs({ interactionMode: "text" });
+          stopAllVoice();
+
+          const fallbackText = getFallbackMessage(voiceLanguage !== "auto" ? voiceLanguage : "en");
+          const fallbackMessages: Msg[] = [
+            ...messages,
+            {
+              id: userMsgId,
+              role: "user",
+              text: userMsgText,
+              time: now,
+            },
+            {
+              id: `fallback-${Date.now()}`,
+              role: "assistant",
+              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              text: `🎤 Voice assistant paused.\n\n${fallbackText}`,
+              engine: "CareerForge AI",
+            },
+          ];
+
+          saveConversations(
+            conversations.map((c) =>
+              c.id === activeConversation.id ? { ...activeConversation, messages: fallbackMessages } : c
+            )
+          );
+          setBusy(false);
+          scrollToBottom();
+
+          // Auto-focus keyboard input immediately
+          requestAnimationFrame(() => {
+            textareaRef.current?.focus();
+          });
+          return;
+        } else {
+          // ── REPEAT / RETRY QUESTION WITH EMPATHETIC GUIDANCE ──
+          const retryText = getQuestionRetryPrompt(currentQ, voiceLanguage !== "auto" ? voiceLanguage : "en");
+          const retryMessages: Msg[] = [
+            ...messages,
+            {
+              id: userMsgId,
+              role: "user",
+              text: userMsgText,
+              time: now,
+            },
+            {
+              id: `ai-retry-${Date.now()}`,
+              role: "assistant",
+              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              text: retryText,
+              engine: "CareerForge AI",
+            },
+          ];
+
+          saveConversations(
+            conversations.map((c) =>
+              c.id === activeConversation.id ? { ...activeConversation, messages: retryMessages } : c
+            )
+          );
+          setBusy(false);
+          scrollToBottom();
+
+          if (voiceMode && accessibilityPrefs?.speechOutput !== false) {
+            setSpeakingMsgId(`ai-retry-${Date.now()}`);
+            setLiveSpokenText(retryText);
+            isAISpeakingRef.current = true;
+            stopListening();
+            speakText(retryText, {
+              lang: voiceLanguage !== "auto" ? voiceLanguage : detectTextLanguage(retryText),
+              onStart: () => {
+                isAISpeakingRef.current = true;
+                stopListening();
+              },
+              onEnd: () => {
+                isAISpeakingRef.current = false;
+                setSpeakingMsgId(null);
+                setLiveSpokenText(null);
+                if (voiceMode && !textFallbackActive) {
+                  setTimeout(() => {
+                    if (!isAISpeakingRef.current) startListening();
+                  }, 650);
+                }
+              },
+              onError: () => {
+                isAISpeakingRef.current = false;
+                setSpeakingMsgId(null);
+                setLiveSpokenText(null);
+              },
+            });
+          }
+          return;
+        }
+      } else {
+        // ── VALID ANSWER RECEIVED: SAVE ANSWER & TRANSITION TO NEXT QUESTION ──
+        currentQ.answered = true;
+        currentQ.answer = valResult.value;
+        currentQ.attempts = 0;
+        setActiveQuestion({ ...currentQ });
+        activeQuestionRef.current = { ...currentQ };
+
+        if (currentQ.id === "onboarding_name") {
+          const nextQ: QuestionState = {
+            id: "onboarding_career",
+            question: `Nice to meet you, ${valResult.value}. What kind of career are you interested in?`,
+            answerType: "job_role",
+            expectedType: "job_role",
+            attempts: 0,
+            maxAttempts: 3,
+            answered: false,
+          };
+          setActiveQuestion(nextQ);
+          activeQuestionRef.current = nextQ;
+        } else if (currentQ.id === "onboarding_career") {
+          setTargetRole(valResult.value);
+          const nextQ: QuestionState = {
+            id: "onboarding_has_resume",
+            question: "Do you already have a resume?",
+            answerType: "yes_no",
+            expectedType: "yes_no",
+            attempts: 0,
+            maxAttempts: 3,
+            answered: false,
+          };
+          setActiveQuestion(nextQ);
+          activeQuestionRef.current = nextQ;
+        } else if (currentQ.id === "onboarding_has_resume") {
+          if (valResult.value === true) {
+            setActiveQuestion(null);
+            activeQuestionRef.current = null;
+          } else {
+            const nextQ: QuestionState = {
+              id: "resume_step_1",
+              question: "Let's build your resume together! What is your full name?",
+              answerType: "name",
+              expectedType: "name",
+              attempts: 0,
+              maxAttempts: 3,
+              answered: false,
+            };
+            setActiveQuestion(nextQ);
+            activeQuestionRef.current = nextQ;
+          }
+        }
+      }
+    }
 
     let fullPromptForLlm = userMsgText;
     if (docInfo) {
@@ -561,6 +883,10 @@ export function AssistantHome({
           },
           targetRole: user?.targetRole || "frontend",
           voiceMode,
+          language: voiceLanguage !== "auto" ? voiceLanguage : undefined,
+          conversationLanguageState: {
+            detectedLanguage: voiceLanguage !== "auto" ? voiceLanguage : "en",
+          },
           currentPage: "assistant",
           accessibilityPrefs,
           resumeDraftState,
@@ -588,6 +914,7 @@ export function AssistantHome({
         "I'm here to support your career journey. What would you like to explore next?";
       const replyTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       const hasFeature = Boolean(data.feature);
+      setLastAssistantReply(replyText);
 
       const intent: ParsedIntent = {
         feature: data.feature || null,
@@ -608,6 +935,7 @@ export function AssistantHome({
           intent,
           redirecting: hasFeature,
           engine: data.engine || "CareerForge AI",
+          thinking: Array.isArray(data.thinking) ? data.thinking : undefined,
         },
       ];
 
@@ -623,12 +951,31 @@ export function AssistantHome({
       scrollToBottom();
 
       // Automatically speak the question and auto-listen for user's voice reply
-      if (voiceMode && accessibilityPrefs?.speechOutput !== false) {
+      if (voiceMode && accessibilityPrefs?.speechOutput !== false && !textFallbackActive) {
+        setSpeakingMsgId(finalMessages[finalMessages.length - 1].id);
+        setLiveSpokenText(replyText);
+        isAISpeakingRef.current = true;
+        stopListening();
         speakText(replyText, {
+          lang: voiceLanguage !== "auto" ? voiceLanguage : detectTextLanguage(replyText),
+          onStart: () => {
+            isAISpeakingRef.current = true;
+            stopListening();
+          },
           onEnd: () => {
-            if (voiceMode) {
-              startListening();
+            isAISpeakingRef.current = false;
+            setSpeakingMsgId(null);
+            setLiveSpokenText(null);
+            if (voiceMode && !textFallbackActive) {
+              setTimeout(() => {
+                if (!isAISpeakingRef.current) startListening();
+              }, 650);
             }
+          },
+          onError: () => {
+            isAISpeakingRef.current = false;
+            setSpeakingMsgId(null);
+            setLiveSpokenText(null);
           },
         });
       }
@@ -637,7 +984,7 @@ export function AssistantHome({
       if (hasFeature && data.feature && (userMsgText.toLowerCase().startsWith("open") || userMsgText.toLowerCase().startsWith("take me to") || userMsgText.toLowerCase().startsWith("go to"))) {
         setRedirectCountdown(3);
         const timer = setTimeout(() => {
-          executeRedirect(data.feature, data.resumeTab);
+          executeRedirect(data.feature as FeatureId, data.resumeTab as ResumeTab);
         }, 3200);
         setActiveTimer(timer);
       }
@@ -660,6 +1007,7 @@ export function AssistantHome({
       setBusy(false);
     }
   };
+  runPromptRef.current = runPrompt;
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -682,11 +1030,11 @@ export function AssistantHome({
   const emptyThread = messages.length <= 1;
 
   return (
-    <div className="flex h-[calc(100vh-4.25rem)] overflow-hidden bg-[#FDFDFB]">
+    <div className="flex h-[calc(100vh-4.25rem)] overflow-hidden bg-paper">
       
       {/* Toast Notification Banner */}
       {toastMessage && (
-        <div className="fixed top-20 right-6 z-50 rounded-xl bg-neutral-900 px-4 py-2.5 text-xs font-semibold text-white shadow-xl animate-in fade-in slide-in-from-top-3 duration-200">
+        <div className="fixed top-20 right-6 z-50 rounded-xl bg-ink px-4 py-2.5 text-xs font-semibold text-white shadow-xl animate-in fade-in slide-in-from-top-3 duration-200">
           {toastMessage}
         </div>
       )}
@@ -701,20 +1049,20 @@ export function AssistantHome({
 
       {/* ─── LEFT AI SIDEBAR (Vertical List of Chats) ───────────────────────── */}
       <aside
-        className={`flex flex-col border-r border-neutral-200 bg-white transition-all duration-200 z-20 ${
+        className={`flex flex-col border-r border-line bg-white transition-all duration-200 z-20 ${
           sidebarOpen ? "w-72 sm:w-80 shrink-0" : "w-0 -translate-x-full overflow-hidden border-none"
         }`}
       >
         {/* Top Action: New Chat */}
-        <div className="p-3.5 border-b border-neutral-200 space-y-3">
+        <div className="p-3.5 border-b border-line space-y-3">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-neutral-500">
-              AI Assistant
+            <span className="font-display text-base italic text-ink">
+              Assistant
             </span>
             <button
               type="button"
               onClick={() => setSidebarOpen(false)}
-              className="rounded p-1 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 sm:hidden"
+              className="rounded p-1 text-graphite/55 hover:bg-mist hover:text-ink sm:hidden"
               title="Close sidebar"
             >
               ✕
@@ -724,7 +1072,7 @@ export function AssistantHome({
           <button
             type="button"
             onClick={createNewConversation}
-            className="w-full flex items-center justify-center gap-2 rounded-xl bg-neutral-900 py-2.5 px-3 text-xs font-semibold text-white shadow-xs hover:bg-black transition-all cursor-pointer"
+            className="w-full flex items-center justify-center gap-2 rounded-xl bg-ink py-2.5 px-3 text-xs font-semibold text-white shadow-xs hover:bg-ink/90 transition-all cursor-pointer"
           >
             <span className="text-sm font-bold">+</span>
             <span>New Chat</span>
@@ -732,19 +1080,19 @@ export function AssistantHome({
         </div>
 
         {/* Vertical Navigation Sections */}
-        <div className="p-2 space-y-1 border-b border-neutral-100">
+        <div className="p-2 space-y-1 border-b border-line">
           <button
             type="button"
             onClick={() => setSidebarTab("all")}
             className={`w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors cursor-pointer ${
               sidebarTab === "all"
-                ? "bg-neutral-100 text-neutral-900 font-semibold"
-                : "text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900"
+                ? "bg-mist text-ink font-semibold"
+                : "text-graphite hover:bg-paper hover:text-ink"
             }`}
           >
-            <ChatBubbleIcon className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+            <ChatBubbleIcon className="w-3.5 h-3.5 text-graphite/80 shrink-0" />
             <span className="flex-1 text-left">All Recent Chats</span>
-            <span className="text-[11px] text-neutral-400 font-mono">
+            <span className="text-[11px] text-graphite/55">
               {conversations.filter((c) => !c.archived).length}
             </span>
           </button>
@@ -754,13 +1102,13 @@ export function AssistantHome({
             onClick={() => setSidebarTab("pinned")}
             className={`w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors cursor-pointer ${
               sidebarTab === "pinned"
-                ? "bg-neutral-100 text-neutral-900 font-semibold"
-                : "text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900"
+                ? "bg-mist text-ink font-semibold"
+                : "text-graphite hover:bg-paper hover:text-ink"
             }`}
           >
             <PinIcon filled className="w-3.5 h-3.5 text-amber-600 shrink-0" />
             <span className="flex-1 text-left">Pinned &amp; Starred</span>
-            <span className="text-[11px] text-neutral-400 font-mono">
+            <span className="text-[11px] text-graphite/55">
               {conversations.filter((c) => c.pinned && !c.archived).length}
             </span>
           </button>
@@ -770,13 +1118,13 @@ export function AssistantHome({
             onClick={() => setSidebarTab("archived")}
             className={`w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors cursor-pointer ${
               sidebarTab === "archived"
-                ? "bg-neutral-100 text-neutral-900 font-semibold"
-                : "text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900"
+                ? "bg-mist text-ink font-semibold"
+                : "text-graphite hover:bg-paper hover:text-ink"
             }`}
           >
-            <ArchiveIcon className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+            <ArchiveIcon className="w-3.5 h-3.5 text-graphite/80 shrink-0" />
             <span className="flex-1 text-left">Archived Chats</span>
-            <span className="text-[11px] text-neutral-400 font-mono">
+            <span className="text-[11px] text-graphite/55">
               {conversations.filter((c) => c.archived).length}
             </span>
           </button>
@@ -784,12 +1132,12 @@ export function AssistantHome({
 
         {/* Vertical Conversation List */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          <p className="px-3 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wider text-neutral-400">
-            {sidebarTab === "pinned" ? "Pinned Discussions" : sidebarTab === "archived" ? "Archive" : "History"}
+          <p className="px-3 pt-2 pb-1 text-[11px] font-medium text-graphite/60">
+            {sidebarTab === "pinned" ? "Pinned" : sidebarTab === "archived" ? "Archive" : "History"}
           </p>
 
           {filteredConversations.length === 0 ? (
-            <div className="p-4 text-center text-xs text-neutral-400">
+            <div className="p-4 text-center text-xs text-graphite/55">
               {sidebarTab === "pinned"
                 ? "No pinned chats. Click the pin icon to keep important chats at top."
                 : sidebarTab === "archived"
@@ -805,8 +1153,8 @@ export function AssistantHome({
                   onClick={() => setActiveConvId(conv.id)}
                   className={`group relative flex items-center justify-between rounded-xl px-3 py-2.5 text-left text-xs transition-colors cursor-pointer ${
                     isActive
-                      ? "bg-neutral-100 font-semibold text-neutral-900"
-                      : "text-neutral-600 hover:bg-neutral-50 hover:text-neutral-900"
+                      ? "bg-mist font-semibold text-ink"
+                      : "text-graphite hover:bg-paper hover:text-ink"
                   }`}
                 >
                   <div className="flex items-center gap-2 min-w-0 flex-1 pr-2">
@@ -814,33 +1162,33 @@ export function AssistantHome({
                     <span className="truncate">{conv.title}</span>
                   </div>
 
-                  {/* Actions on Hover */}
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  {/* Actions (Always visible with clear icons) */}
+                  <div className="flex items-center gap-1 opacity-70 group-hover:opacity-100 transition-opacity">
                     <button
                       type="button"
                       onClick={(e) => togglePin(conv.id, e)}
                       title={conv.pinned ? "Unpin chat" : "Pin chat to top"}
-                      className="rounded p-1 text-neutral-400 hover:bg-neutral-200 hover:text-amber-600 transition-colors"
+                      className="rounded p-1 text-graphite/60 hover:bg-mist hover:text-amber-600 transition-colors"
                     >
-                      <PinIcon filled={conv.pinned} className="w-3 h-3" />
+                      <PinIcon filled={conv.pinned} className="w-3.5 h-3.5" />
                     </button>
 
                     <button
                       type="button"
                       onClick={(e) => toggleArchive(conv.id, e)}
                       title={conv.archived ? "Unarchive chat" : "Archive chat"}
-                      className="rounded p-1 text-neutral-400 hover:bg-neutral-200 hover:text-neutral-800 transition-colors"
+                      className="rounded p-1 text-graphite/60 hover:bg-mist hover:text-ink transition-colors"
                     >
-                      <ArchiveIcon className="w-3 h-3" />
+                      <ArchiveIcon className="w-3.5 h-3.5" />
                     </button>
 
                     <button
                       type="button"
                       onClick={(e) => deleteConversation(conv.id, e)}
                       title="Delete chat"
-                      className="rounded p-1 text-neutral-400 hover:bg-neutral-200 hover:text-red-600 transition-colors"
+                      className="rounded p-1 text-graphite/60 hover:bg-mist hover:text-red-600 transition-colors"
                     >
-                      <TrashIcon className="w-3 h-3" />
+                      <TrashIcon className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>
@@ -848,48 +1196,164 @@ export function AssistantHome({
             })
           )}
         </div>
+
+        {/* Sidebar Footer: Delete All Chats */}
+        <div className="p-3 border-t border-line bg-paper/40">
+          <button
+            type="button"
+            onClick={clearAllConversations}
+            disabled={conversations.length === 0 || (conversations.length === 1 && conversations[0].messages.length === 0)}
+            className="w-full flex items-center justify-center gap-2 rounded-lg border border-line bg-white px-3 py-2 text-xs font-medium text-graphite hover:text-red-600 hover:border-red-200 hover:bg-red-50/50 transition-colors cursor-pointer shadow-2xs disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Delete all chat history and start fresh"
+          >
+            <TrashIcon className="w-3.5 h-3.5" />
+            <span>Delete All Chats</span>
+          </button>
+        </div>
       </aside>
 
       {/* ─── MAIN CHAT VIEW ─────────────────────────────────────────────────── */}
       <div className="flex flex-1 flex-col overflow-hidden">
         
         {/* Top Chat Toolbar */}
-        <div className="flex items-center justify-between border-b border-neutral-200 bg-white px-4 py-2.5">
-          <div className="flex items-center gap-2.5">
-            <button
-              type="button"
-              onClick={() => setSidebarOpen(!sidebarOpen)}
-              className="flex items-center gap-1.5 rounded-lg border border-neutral-200 px-2.5 py-1.5 text-xs font-semibold text-neutral-700 hover:bg-neutral-50 shadow-xs cursor-pointer"
-              title="Toggle Sidebar"
-            >
-              <SidebarToggleIcon className="w-3.5 h-3.5" />
-              <span>{sidebarOpen ? "Hide Chats" : "Show Chats"}</span>
-            </button>
-
-            <span className="text-xs font-semibold text-neutral-800 truncate max-w-[180px] sm:max-w-md">
-              {activeConversation?.title || "Career Copilot"}
-            </span>
-          </div>
-
+        <div className="flex flex-wrap items-center justify-between border-b border-line bg-white px-3 sm:px-4 py-2 gap-2">
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setShareModalOpen(true)}
-              className="flex items-center gap-1.5 rounded-lg border border-neutral-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-neutral-700 hover:bg-neutral-50 hover:border-neutral-300 transition-all shadow-xs cursor-pointer"
-              title="Share conversation link or transcript"
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-xs font-semibold text-graphite hover:bg-paper shadow-xs cursor-pointer"
+              title="Toggle Sidebar"
+              aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
             >
-              <ShareHeaderIcon className="w-3.5 h-3.5 text-neutral-600" />
-              <span>Share</span>
+              <SidebarToggleIcon className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{sidebarOpen ? "Hide Chats" : "Show Chats"}</span>
+            </button>
+
+            <span className="text-xs font-semibold text-ink truncate max-w-[140px] sm:max-w-xs">
+              {activeConversation?.title || "Career Copilot"}
+            </span>
+
+            {/* Dynamic Real-Time Voice State Status Badge */}
+            {speakingMsgId && (
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-accent">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent" />
+                Speaking
+              </span>
+            )}
+            {!speakingMsgId && listening && (
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-accent">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
+                Listening
+              </span>
+            )}
+            {!speakingMsgId && !listening && busy && (
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-graphite">
+                <span className="h-1.5 w-1.5 rounded-full bg-graphite/50" />
+                Thinking
+              </span>
+            )}
+            {textFallbackActive && !listening && !speakingMsgId && (
+              <span className="flex items-center gap-1.5 text-[11px] font-medium text-graphite">
+                <span className="h-1.5 w-1.5 rounded-full bg-graphite/40" />
+                Text mode
+              </span>
+            )}
+          </div>
+
+          {/* Voice Toolbar: Provider, Language, Repeat, Stop, Mute */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Language Selector Dropdown */}
+            <select
+              value={voiceLanguage}
+              onChange={(e) => setVoiceLanguage(e.target.value)}
+              title="Select speech and assistant language"
+              aria-label="Speech Language Selector"
+              className="rounded-lg border border-line bg-paper px-2 py-1 text-xs font-medium text-graphite hover:bg-mist focus:outline-none focus:ring-1 focus:ring-accent/40 cursor-pointer"
+            >
+              <option value="auto">🌐 Auto Detect Language</option>
+              {LANGUAGE_LIST.map((l) => (
+                <option key={l.code} value={l.code}>
+                  {l.flag} {l.nativeName} ({l.name})
+                </option>
+              ))}
+            </select>
+
+
+            {/* Repeat Button */}
+            <button
+              type="button"
+              onClick={repeatLastResponse}
+              title="Repeat last spoken response"
+              aria-label="Repeat last spoken response"
+              className="flex items-center gap-1.5 rounded-lg border border-line bg-white px-2 py-1 text-xs font-medium text-graphite hover:bg-paper hover:text-ink transition-colors cursor-pointer"
+            >
+              <SpeakerIcon className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Repeat</span>
+            </button>
+
+            {/* Stop Speaking / Listening Button */}
+            {(speakingMsgId || listening) && (
+              <button
+                type="button"
+                onClick={stopAllVoice}
+                title="Stop audio and listening immediately"
+                aria-label="Stop audio and listening"
+                className="flex items-center gap-1.5 rounded-lg bg-red-600 px-2 py-1 text-xs font-semibold text-white hover:bg-red-700 transition-colors cursor-pointer"
+              >
+                <StopIcon className="w-3 h-3 text-white" />
+                <span>Stop</span>
+              </button>
+            )}
+
+            {/* Mute / Unmute Toggle */}
+            <button
+              type="button"
+              onClick={toggleMute}
+              title={accessibilityPrefs.speechOutput ? "Mute Voice Output" : "Enable Voice Output"}
+              aria-label={accessibilityPrefs.speechOutput ? "Mute Voice Output" : "Enable Voice Output"}
+              className={`flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs font-medium transition-colors cursor-pointer ${
+                accessibilityPrefs.speechOutput
+                  ? "border-accent/25 bg-accent/10 text-accent hover:bg-accent/20"
+                  : "border-line bg-mist text-graphite/80 hover:bg-mist"
+              }`}
+            >
+              <SpeakerIcon className={`w-3.5 h-3.5 ${accessibilityPrefs.speechOutput ? "" : "opacity-40"}`} />
+              <span className="hidden sm:inline">{accessibilityPrefs.speechOutput ? "Voice on" : "Muted"}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShareModalOpen(true)}
+              className="flex items-center gap-1.5 rounded-lg border border-line bg-white px-2 py-1 text-xs font-semibold text-graphite hover:bg-paper shadow-xs cursor-pointer"
+              title="Share conversation link or transcript"
+              aria-label="Share Conversation"
+            >
+              <ShareHeaderIcon className="w-3.5 h-3.5 text-graphite" />
+              <span className="hidden sm:inline">Share</span>
             </button>
 
             <button
               type="button"
               onClick={createNewConversation}
-              className="flex items-center gap-1 rounded-lg border border-neutral-200 px-2.5 py-1.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 cursor-pointer"
+              className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-xs font-medium text-graphite hover:bg-paper cursor-pointer shadow-xs"
               title="Start new chat"
+              aria-label="Start New Chat"
             >
               <span>+ New</span>
             </button>
+
+            {activeConversation && (
+              <button
+                type="button"
+                onClick={(e) => deleteConversation(activeConversation.id, e)}
+                className="flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-xs font-medium text-graphite hover:text-red-600 hover:bg-red-50/50 cursor-pointer shadow-xs transition-colors"
+                title="Delete this chat"
+                aria-label="Delete Current Chat"
+              >
+                <TrashIcon className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Delete</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -897,28 +1361,62 @@ export function AssistantHome({
         <div ref={listRef} className="flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-3xl flex-col px-4 py-8 md:py-12">
             {emptyThread && (
-              <div className="mb-8 text-center space-y-4">
-                <h1 className="font-display text-3xl italic text-ink md:text-4xl tracking-tight">
-                  {userDisplayName ? `Hello, ${userDisplayName}` : "How can I help you today?"}
+              <div className="mb-10 max-w-xl space-y-5">
+                <h1 className="font-display text-4xl italic leading-[1.1] text-ink md:text-5xl">
+                  {userDisplayName ? `Hello, ${userDisplayName}.` : "Hello."}
+                  <span className="block text-graphite">Where should we start?</span>
                 </h1>
 
-                <p className="mx-auto max-w-md text-xs text-graphite leading-relaxed">
-                  I can help you build or improve your resume, find skills to learn, discover projects, and find jobs. You can talk to me or type.
+                <p className="max-w-md text-sm leading-relaxed text-graphite">
+                  I can help you build or sharpen your resume, choose skills to learn,
+                  find projects worth doing, and track down jobs. Speak or type &mdash;
+                  whichever is easier.
                 </p>
 
                 {/* Primary Voice vs Text Entry Options */}
-                <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                <div className="flex flex-wrap items-center gap-3 pt-1">
                   <button
                     type="button"
                     onClick={() => {
+                      const initialQ: QuestionState = {
+                        id: "onboarding_name",
+                        question: "Hi! I'm your career assistant. What would you like me to call you?",
+                        answerType: "name",
+                        expectedType: "name",
+                        attempts: 0,
+                        maxAttempts: 3,
+                        answered: false,
+                      };
+                      setActiveQuestion(initialQ);
+                      activeQuestionRef.current = initialQ;
                       setVoiceMode(true);
-                      toggleListening();
-                      speakText("Hi! I'm your career assistant. I can help you build or improve your resume, find skills to learn, discover projects, and find jobs. How can I help you today?");
+                      setTextFallbackActive(false);
+                      stopListening();
+                      isAISpeakingRef.current = true;
+                      speakText(
+                        "Hi! I'm your career assistant. I'll guide you step by step. You can speak naturally, and you can interrupt me anytime. What would you like me to call you?",
+                        {
+                          lang: voiceLanguage !== "auto" ? voiceLanguage : "en-US",
+                          onStart: () => {
+                            isAISpeakingRef.current = true;
+                            stopListening();
+                          },
+                          onEnd: () => {
+                            isAISpeakingRef.current = false;
+                            setTimeout(() => {
+                              if (!isAISpeakingRef.current) startListening();
+                            }, 300);
+                          },
+                          onError: () => {
+                            isAISpeakingRef.current = false;
+                          },
+                        }
+                      );
                     }}
-                    className="flex items-center gap-2 rounded-full bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 text-xs font-semibold shadow-md transition-all cursor-pointer transform hover:-translate-y-0.5"
+                    className="inline-flex items-center gap-2 rounded-full bg-ink px-5 py-2.5 text-sm font-medium text-paper transition-colors hover:bg-ink/90 cursor-pointer"
                   >
-                    <span className="text-sm">🎙️</span>
-                    <span>Talk to me (Voice)</span>
+                    <MicIcon className="w-4 h-4 text-paper" />
+                    <span>Start talking</span>
                   </button>
 
                   <button
@@ -926,10 +1424,9 @@ export function AssistantHome({
                     onClick={() => {
                       textareaRef.current?.focus();
                     }}
-                    className="flex items-center gap-2 rounded-full border border-neutral-300 bg-white hover:bg-neutral-50 text-neutral-800 px-5 py-2.5 text-xs font-semibold shadow-xs transition-all cursor-pointer"
+                    className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium text-graphite underline decoration-line underline-offset-4 transition-colors hover:text-ink cursor-pointer"
                   >
-                    <span className="text-sm">⌨️</span>
-                    <span>Type to me (Text)</span>
+                    <span>Type instead</span>
                   </button>
                 </div>
               </div>
@@ -944,10 +1441,10 @@ export function AssistantHome({
                     key={m.id}
                     className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}
                   >
-                    <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-neutral-400 px-1">
+                    <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-graphite/55 px-1">
                       <span>{isUser ? userDisplayName : "CareerForge AI"}</span>
                       {m.engine && !isUser && (
-                        <span className="rounded bg-neutral-100 px-1.5 py-0.2 text-[9px] font-mono text-neutral-600 border border-neutral-200">
+                        <span className="text-[10px] text-graphite/45">
                           {m.engine}
                         </span>
                       )}
@@ -955,16 +1452,16 @@ export function AssistantHome({
                         <button
                           type="button"
                           onClick={() => toggleSpeech(m.id, m.text)}
-                          className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium transition-all cursor-pointer ${
+                          className={`flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors cursor-pointer ${
                             speakingMsgId === m.id
-                              ? "bg-blue-100 text-blue-800 animate-pulse border border-blue-300 shadow-2xs"
-                              : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800"
+                              ? "bg-accent/10 text-accent border border-accent/25"
+                              : "text-graphite/80 hover:bg-mist hover:text-ink"
                           }`}
                           title={speakingMsgId === m.id ? "Stop reading aloud" : "Click-to-Voice (Listen Aloud)"}
                         >
                           {speakingMsgId === m.id ? (
                             <>
-                              <StopIcon className="w-2.5 h-2.5 text-blue-600" />
+                              <StopIcon className="w-2.5 h-2.5 text-accent" />
                               <span>Stop</span>
                             </>
                           ) : (
@@ -975,50 +1472,61 @@ export function AssistantHome({
                           )}
                         </button>
                       )}
-                      {m.time && <span>&bull; {m.time}</span>}
+                      {m.time && <span className="text-graphite/45">{m.time}</span>}
                     </div>
 
                     <div className="space-y-2 max-w-[90%] sm:max-w-[80%]">
                       {m.attachedDocName && (
-                        <div className="flex items-center gap-1.5 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-1 text-xs text-neutral-700 w-fit">
-                          <PaperclipIcon className="w-3.5 h-3.5 text-neutral-500" />
+                        <div className="flex items-center gap-1.5 rounded-lg border border-line bg-paper px-2.5 py-1 text-xs text-graphite w-fit">
+                          <PaperclipIcon className="w-3.5 h-3.5 text-graphite/80" />
                           <span className="font-medium truncate max-w-[200px]">{m.attachedDocName}</span>
                         </div>
+                      )}
+
+                      {/* Expandable Thought Deliberation like Claude / ChatGPT */}
+                      {!isUser && m.thinking && m.thinking.length > 0 && (
+                        <ThinkingProcess steps={m.thinking} />
                       )}
 
                       <div
                         className={`rounded-2xl px-5 py-3.5 text-sm leading-relaxed ${
                           isUser
-                            ? "bg-ink text-paper rounded-tr-xs shadow-sm font-normal"
-                            : "border border-neutral-200/80 bg-white text-ink rounded-tl-xs shadow-xs"
+                            ? "bg-ink text-paper rounded-tr-xs"
+                            : "bg-white text-ink rounded-tl-xs border border-line/60"
                         }`}
                       >
-                        <p className="whitespace-pre-line">{m.text}</p>
+                        {isUser ? (
+                          <p className="whitespace-pre-line">{m.text}</p>
+                        ) : (
+                          <div className="prose prose-sm max-w-none text-ink space-y-2 leading-relaxed [&>h3]:text-base [&>h3]:font-bold [&>h3]:text-ink [&>h3]:mt-2.5 [&>h3]:mb-1.5 [&>h4]:text-sm [&>h4]:font-semibold [&>h4]:text-ink [&>h4]:mt-2 [&>p]:my-1.5 [&>ul]:list-disc [&>ul]:pl-5 [&>ul]:my-1.5 [&>ol]:list-decimal [&>ol]:pl-5 [&>ol]:my-1.5 [&>pre]:bg-ink [&>pre]:text-paper [&>pre]:p-3.5 [&>pre]:rounded-xl [&>pre]:my-2.5 [&>pre]:overflow-x-auto [&>code]:bg-paper [&>code]:px-1.5 [&>code]:py-0.5 [&>code]:rounded [&>code]:text-xs [&>code]:font-mono [&>a]:text-accent [&>a]:underline [&>blockquote]:border-l-2 [&>blockquote]:border-accent [&>blockquote]:pl-3 [&>blockquote]:italic">
+                            <ReactMarkdown>{m.text}</ReactMarkdown>
+                          </div>
+                        )}
                       </div>
 
                       {/* Interactive Workspace Action */}
                       {m.intent?.feature && (
-                        <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 shadow-xs space-y-2.5 animate-in fade-in zoom-in-98 duration-150">
+                        <div className="rounded-xl border border-line bg-paper p-4 shadow-xs space-y-2.5 animate-in fade-in zoom-in-98 duration-150">
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
-                              <span className="flex h-2 w-2 rounded-full bg-blue-500" />
-                              <span className="text-xs font-semibold text-neutral-900">
+                              <span className="flex h-2 w-2 rounded-full bg-accent" />
+                              <span className="text-xs font-semibold text-ink">
                                 {m.intent.featureTitle || "Workspace Tool"}
                               </span>
                             </div>
                             {m.redirecting && redirectCountdown !== null && (
-                              <span className="text-[11px] font-semibold text-amber-700 animate-pulse">
-                                Opening in 3s…
+                              <span className="text-[11px] font-medium text-graphite">
+                                Opening in 3s
                               </span>
                             )}
                           </div>
 
-                          <div className="flex items-center justify-end gap-2 pt-1 border-t border-neutral-200/60">
+                          <div className="flex items-center justify-end gap-2 pt-1 border-t border-line">
                             {m.redirecting && (
                               <button
                                 type="button"
                                 onClick={cancelRedirect}
-                                className="rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 hover:text-ink transition-colors cursor-pointer"
+                                className="rounded-lg border border-line bg-white px-3 py-1.5 text-xs font-medium text-graphite hover:bg-mist hover:text-ink transition-colors cursor-pointer"
                               >
                                 Stay in Chat
                               </button>
@@ -1026,7 +1534,7 @@ export function AssistantHome({
                             <button
                               type="button"
                               onClick={() => executeRedirect(m.intent!.feature!, m.intent!.resumeTab)}
-                              className="inline-flex items-center gap-1.5 rounded-lg bg-ink px-4 py-2 text-xs font-semibold text-white hover:bg-neutral-800 transition-colors shadow-sm cursor-pointer"
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-ink px-4 py-2 text-xs font-semibold text-white hover:bg-ink/90 transition-colors shadow-sm cursor-pointer"
                             >
                               <span>Open {m.intent.featureTitle || "Tool"}</span>
                               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1043,14 +1551,14 @@ export function AssistantHome({
 
               {busy && redirectCountdown === null && (
                 <div className="flex flex-col items-start">
-                  <div className="mb-1 text-[11px] font-medium text-neutral-400 px-1">
+                  <div className="mb-1 text-[11px] font-medium text-graphite/55 px-1">
                     CareerForge AI is thinking…
                   </div>
-                  <div className="rounded-2xl rounded-tl-xs border border-neutral-200 bg-white px-4 py-3 shadow-xs">
+                  <div className="rounded-2xl rounded-tl-xs border border-line bg-white px-4 py-3 shadow-xs">
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2 w-2 rounded-full bg-neutral-400 animate-bounce [animation-delay:-0.3s]" />
-                      <span className="h-2 w-2 rounded-full bg-neutral-400 animate-bounce [animation-delay:-0.15s]" />
-                      <span className="h-2 w-2 rounded-full bg-neutral-400 animate-bounce" />
+                      <span className="h-2 w-2 rounded-full bg-graphite/50 animate-bounce [animation-delay:-0.3s]" />
+                      <span className="h-2 w-2 rounded-full bg-graphite/50 animate-bounce [animation-delay:-0.15s]" />
+                      <span className="h-2 w-2 rounded-full bg-graphite/50 animate-bounce" />
                     </div>
                   </div>
                 </div>
@@ -1060,9 +1568,42 @@ export function AssistantHome({
         </div>
 
         {/* ─── CLEAN BOTTOM PROMPT COMPOSER & PILLS MATCHING PHOTO 3 ─────────── */}
-        <div className="border-t border-neutral-200/80 bg-white/95 px-4 pb-5 pt-3 backdrop-blur-md">
+        <div className="border-t border-line bg-white/95 px-4 pb-5 pt-3 backdrop-blur-md">
           <div className="mx-auto max-w-3xl space-y-3">
             
+            {/* Live Spoken Text & Captions Visualizer for Accessibility */}
+            {(liveSpokenText || listening || speakingMsgId) && (
+              <div
+                role="region"
+                aria-label="Live Voice Captions"
+                aria-live="polite"
+                className="flex items-center justify-between rounded-xl border border-accent/25 bg-accent/10 px-3.5 py-2 text-xs text-accent shadow-sm animate-in fade-in slide-in-from-bottom-2"
+              >
+                <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
+                  <span className="flex h-2.5 w-2.5 shrink-0 rounded-full bg-accent animate-ping" />
+                  <div className="truncate">
+                    <span className="font-semibold text-accent">
+                      {listening ? "Listening" : "Speaking"}
+                      <span className="mx-1.5 text-accent/40">/</span>
+                    </span>
+                    <span className="font-normal text-accent">
+                      {listening ? (input ? `"${input}"` : "Speak now, I'm listening") : liveSpokenText}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={stopAllVoice}
+                    className="rounded-md bg-accent/15 px-2 py-0.5 text-[11px] font-semibold text-accent hover:bg-accent/25 transition-colors cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Hidden Document File Input */}
             <input
               ref={fileInputRef}
@@ -1076,20 +1617,20 @@ export function AssistantHome({
             {/* AI Rounded Card Box */}
             <form
               onSubmit={onSubmit}
-              className="relative flex flex-col rounded-2xl sm:rounded-3xl border border-neutral-300 bg-neutral-50/70 p-3 shadow-sm focus-within:border-neutral-400 focus-within:bg-white focus-within:ring-2 focus-within:ring-neutral-900/5 transition-all"
+              className="relative flex flex-col rounded-2xl sm:rounded-3xl border border-line bg-paper p-3 shadow-sm focus-within:border-graphite focus-within:bg-white focus-within:ring-2 focus-within:ring-ink/5 transition-colors"
             >
               {/* Attached Document Preview Badge */}
               {attachedFile && (
-                <div className="mb-2 flex items-center justify-between rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-800 animate-in fade-in shadow-2xs">
+                <div className="mb-2 flex items-center justify-between rounded-xl border border-line bg-white px-3 py-1.5 text-xs text-ink animate-in fade-in shadow-2xs">
                   <div className="flex items-center gap-2 truncate">
-                    <PaperclipIcon className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                    <PaperclipIcon className="w-3.5 h-3.5 text-accent shrink-0" />
                     <span className="font-semibold truncate">{attachedFile.name}</span>
-                    <span className="text-[10px] text-neutral-400 font-mono">(Ready for AI audit)</span>
+                    <span className="text-[10px] text-graphite/55">Ready to review</span>
                   </div>
                   <button
                     type="button"
                     onClick={() => setAttachedFile(null)}
-                    className="rounded p-1 text-neutral-400 hover:text-red-600 cursor-pointer"
+                    className="rounded p-1 text-graphite/55 hover:text-red-600 cursor-pointer"
                     title="Remove attachment"
                   >
                     ✕
@@ -1122,11 +1663,11 @@ export function AssistantHome({
                     ? `Ask anything about ${attachedFile.name}...`
                     : "Message CareerForge AI or attach a document..."
                 }
-                className="max-h-36 min-h-[36px] w-full resize-none bg-transparent px-1 py-1 text-sm text-neutral-900 placeholder:text-neutral-400 focus:outline-none"
+                className="max-h-36 min-h-[36px] w-full resize-none bg-transparent px-1 py-1 text-sm text-ink placeholder:text-graphite/55 focus:outline-none"
               />
 
               {/* Bottom Control Bar inside Composer */}
-              <div className="flex items-center justify-between pt-2 border-t border-neutral-200/50 mt-1">
+              <div className="flex items-center justify-between pt-2 border-t border-line mt-1">
                 {/* Left Controls: Clean Attach & Unlimited Voice */}
                 <div className="flex items-center gap-1.5">
                   <button
@@ -1134,12 +1675,12 @@ export function AssistantHome({
                     onClick={() => fileInputRef.current?.click()}
                     disabled={parsingDoc}
                     title="Attach document (PDF, DOCX, TXT)"
-                    className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-200/70 hover:text-neutral-900 transition-colors disabled:opacity-50 cursor-pointer"
+                    className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium text-graphite hover:bg-mist hover:text-ink transition-colors disabled:opacity-50 cursor-pointer"
                   >
                     {parsingDoc ? (
-                      <span className="h-3.5 w-3.5 rounded-full border-2 border-neutral-500 border-t-transparent animate-spin" />
+                      <span className="h-3.5 w-3.5 rounded-full border-2 border-graphite border-t-transparent animate-spin" />
                     ) : (
-                      <PaperclipIcon className="w-3.5 h-3.5 text-neutral-500" />
+                      <PaperclipIcon className="w-3.5 h-3.5 text-graphite/80" />
                     )}
                     <span className="hidden sm:inline">Attach</span>
                   </button>
@@ -1150,8 +1691,8 @@ export function AssistantHome({
                     onClick={toggleListening}
                     className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-all cursor-pointer ${
                       listening
-                        ? "bg-red-500 text-white animate-pulse shadow-sm"
-                        : "text-neutral-600 hover:bg-neutral-200/70 hover:text-neutral-900"
+                        ? "bg-ink text-paper"
+                        : "text-graphite hover:bg-mist hover:text-ink"
                     }`}
                     title={
                       listening
@@ -1159,7 +1700,7 @@ export function AssistantHome({
                         : "Voice Dictation in any language (Auto-sends on pause)"
                     }
                   >
-                    <MicIcon className={`w-3.5 h-3.5 ${listening ? "text-white animate-bounce" : "text-neutral-500"}`} />
+                    <MicIcon className={`w-3.5 h-3.5 ${listening ? "text-paper" : "text-graphite/80"}`} />
                     <span>{listening ? (silenceCountdown ? `Auto-sending in ${silenceCountdown}s…` : "Listening…") : "Voice"}</span>
                   </button>
 
@@ -1176,8 +1717,8 @@ export function AssistantHome({
                   disabled={busy || (!input.trim() && !attachedFile)}
                   className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-all shadow-xs ${
                     input.trim() || attachedFile
-                      ? "bg-neutral-900 text-white hover:bg-black scale-100 cursor-pointer"
-                      : "bg-neutral-200 text-neutral-400 cursor-not-allowed opacity-60"
+                      ? "bg-ink text-white hover:bg-ink/90 scale-100 cursor-pointer"
+                      : "bg-mist text-graphite/55 cursor-not-allowed opacity-60"
                   }`}
                   title="Send prompt (or press Enter)"
                 >
@@ -1194,10 +1735,10 @@ export function AssistantHome({
                 onClick={() => scrollPrompts("left")}
                 disabled={!canScrollLeft}
                 aria-label="Scroll prompts left"
-                className={`absolute left-0 z-10 flex h-7 w-7 items-center justify-center rounded-full border border-neutral-200 bg-white/95 shadow-md backdrop-blur-xs transition-all ${
+                className={`absolute left-0 z-10 flex h-7 w-7 items-center justify-center rounded-full border border-line bg-white/95 shadow-sm backdrop-blur-xs transition-colors ${
                   canScrollLeft
-                    ? "opacity-100 hover:bg-neutral-100 hover:scale-105 cursor-pointer text-neutral-800"
-                    : "opacity-0 pointer-events-none text-neutral-300"
+                    ? "opacity-100 hover:bg-mist cursor-pointer text-ink"
+                    : "opacity-0 pointer-events-none text-graphite/55"
                 }`}
               >
                 <ChevronLeftIcon className="w-4 h-4" />
@@ -1215,7 +1756,7 @@ export function AssistantHome({
                     key={pill.label}
                     type="button"
                     onClick={() => runPrompt(pill.prompt)}
-                    className="shrink-0 rounded-full border border-neutral-200 bg-white px-3.5 py-1.5 text-xs font-medium text-neutral-700 hover:border-neutral-900 hover:text-neutral-900 hover:bg-neutral-50 transition-all shadow-2xs cursor-pointer whitespace-nowrap active:scale-95"
+                    className="shrink-0 rounded-full border border-line bg-white px-3.5 py-1.5 text-xs font-medium text-graphite hover:border-ink hover:text-ink transition-colors cursor-pointer whitespace-nowrap"
                   >
                     {pill.label}
                   </button>
@@ -1228,10 +1769,10 @@ export function AssistantHome({
                 onClick={() => scrollPrompts("right")}
                 disabled={!canScrollRight}
                 aria-label="Scroll prompts right"
-                className={`absolute right-0 z-10 flex h-7 w-7 items-center justify-center rounded-full border border-neutral-200 bg-white/95 shadow-md backdrop-blur-xs transition-all ${
+                className={`absolute right-0 z-10 flex h-7 w-7 items-center justify-center rounded-full border border-line bg-white/95 shadow-sm backdrop-blur-xs transition-colors ${
                   canScrollRight
-                    ? "opacity-100 hover:bg-neutral-100 hover:scale-105 cursor-pointer text-neutral-800"
-                    : "opacity-0 pointer-events-none text-neutral-300"
+                    ? "opacity-100 hover:bg-mist cursor-pointer text-ink"
+                    : "opacity-0 pointer-events-none text-graphite/55"
                 }`}
               >
                 <ChevronRightIcon className="w-4 h-4" />

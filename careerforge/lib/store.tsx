@@ -9,12 +9,23 @@ import {
 } from "react";
 import { RoleId, User } from "./types";
 import { upsertUser, updateUserRole } from "./db";
+import { SpeechProviderType, ConversationLanguageState } from "./speech/types";
 
+const STORAGE_KEY = "careerforge_user";
+const VOICE_MODE_KEY = "careerforge_voice_mode";
+const VOICE_LANG_KEY = "careerforge_voice_lang";
+const SPEECH_PROVIDER_KEY = "careerforge_speech_provider";
+const VOICE_CHECKED_KEY = "careerforge_voice_checked";
+const ACCESS_PREFS_KEY = "careerforge_access_prefs";
+const USER_SKILLS_KEY = "careerforge_user_skills";
+const LOCATION_KEY = "careerforge_location";
 export interface AccessibilityPreferences {
   interactionMode: "voice" | "text" | "hybrid";
   speechOutput: boolean;
+  voiceNavigation: boolean;
   visualResponses: boolean;
   simplifiedLanguage: boolean;
+  captions: boolean;
   screenReaderMode: boolean;
   highContrast: boolean;
   largeText: boolean;
@@ -24,8 +35,10 @@ export interface AccessibilityPreferences {
 export const defaultAccessibilityPreferences: AccessibilityPreferences = {
   interactionMode: "text",
   speechOutput: true,
+  voiceNavigation: false,
   visualResponses: true,
   simplifiedLanguage: false,
+  captions: true,
   screenReaderMode: false,
   highContrast: false,
   largeText: false,
@@ -36,20 +49,34 @@ interface AppState {
   user: User | null;
   ready: boolean;
   signIn: (email: string, name?: string) => Promise<void>;
-  signInWithGoogle: (name: string, email: string, picture?: string) => Promise<void>;
-  signInWithGithub: (name: string, email: string, picture?: string) => Promise<void>;
+  signInWithGoogle: (
+    name: string,
+    email: string,
+    picture?: string,
+  ) => Promise<void>;
+  signInWithGithub: (
+    name: string,
+    email: string,
+    picture?: string,
+  ) => Promise<void>;
   signInWithPhone: (phone: string, name?: string) => Promise<void>;
   signOut: () => void;
   setTargetRole: (role: RoleId) => void;
   // ─── Voice & Accessibility Mode State ──────────────────────────────────────
   voiceMode: boolean;
   voiceLanguage: string;
+  speechProvider: SpeechProviderType;
   voiceChecked: boolean;
   accessibilityPrefs: AccessibilityPreferences;
+  conversationLanguageState: ConversationLanguageState;
   setVoiceMode: (active: boolean) => void;
   setVoiceLanguage: (lang: string) => void;
+  setSpeechProvider: (provider: SpeechProviderType) => void;
   setVoiceChecked: (checked: boolean) => void;
   setAccessibilityPrefs: (prefs: Partial<AccessibilityPreferences>) => void;
+  setConversationLanguageState: (
+    state: Partial<ConversationLanguageState>,
+  ) => void;
   // ─── Session State for Agent Intelligence ──────────────────────────────────
   currentLocation: string | null;
   setCurrentLocation: (loc: string | null) => void;
@@ -61,14 +88,18 @@ interface AppState {
   setActiveResumeText: (text: string | null) => void;
 }
 
+/** The slice of AppProvider state persisted server-side via /api/user. */
+export interface PersistedUserState {
+  voiceMode: boolean;
+  voiceLanguage: string;
+  speechProvider: SpeechProviderType;
+  voiceChecked: boolean;
+  accessibilityPrefs: AccessibilityPreferences;
+  userSkills: string[];
+  currentLocation: string | null;
+}
+
 const AppContext = createContext<AppState | null>(null);
-const STORAGE_KEY = "careerforge.user";
-const VOICE_MODE_KEY = "careerforge.voiceMode";
-const VOICE_LANG_KEY = "careerforge.voiceLang";
-const VOICE_CHECKED_KEY = "careerforge.voiceChecked";
-const ACCESS_PREFS_KEY = "careerforge.accessPrefs";
-const USER_SKILLS_KEY = "careerforge.userSkills";
-const LOCATION_KEY = "careerforge.userLocation";
 
 function extractDisplayName(email: string, name?: string): string {
   if (name && name.trim()) return name.trim();
@@ -85,25 +116,45 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [voiceMode, setVoiceModeState] = useState(true);
   const [voiceLanguage, setVoiceLanguageState] = useState("auto");
+  const [speechProvider, setSpeechProviderState] =
+    useState<SpeechProviderType>("auto");
   const [voiceChecked, setVoiceCheckedState] = useState(false);
-  const [accessibilityPrefs, setAccessibilityPrefsState] = useState<AccessibilityPreferences>(
-    defaultAccessibilityPreferences
+  const [accessibilityPrefs, setAccessibilityPrefsState] =
+    useState<AccessibilityPreferences>(defaultAccessibilityPreferences);
+  const [conversationLanguageState, setConversationLanguageStateState] =
+    useState<ConversationLanguageState>({
+      detectedLanguage: "en",
+      preferredLanguage: "auto",
+    });
+  const [currentLocation, setCurrentLocationState] = useState<string | null>(
+    null,
   );
-  const [currentLocation, setCurrentLocationState] = useState<string | null>(null);
   const [userSkills, setUserSkillsState] = useState<string[]>([]);
   const [missingSkills, setMissingSkillsState] = useState<string[]>([]);
-  const [activeResumeText, setActiveResumeTextState] = useState<string | null>(null);
+  const [activeResumeText, setActiveResumeTextState] = useState<string | null>(
+    null,
+  );
 
+  // Hydrate instantly from localStorage, then sync with server in background
   useEffect(() => {
+    let cancelled = false;
+
+    // Step 1: Immediately restore from localStorage synchronously so UI renders with zero delay
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) setUser(JSON.parse(raw));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.email) setUser(parsed);
+      }
 
       const vm = window.localStorage.getItem(VOICE_MODE_KEY);
       if (vm !== null) setVoiceModeState(vm === "true");
 
       const vl = window.localStorage.getItem(VOICE_LANG_KEY);
       if (vl) setVoiceLanguageState(vl);
+
+      const sp = window.localStorage.getItem(SPEECH_PROVIDER_KEY);
+      if (sp) setSpeechProviderState(sp as SpeechProviderType);
 
       const vc = window.localStorage.getItem(VOICE_CHECKED_KEY);
       if (vc !== null) setVoiceCheckedState(vc === "true");
@@ -117,10 +168,88 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const loc = window.localStorage.getItem(LOCATION_KEY);
       if (loc) setCurrentLocationState(loc);
     } catch {
-      // localStorage unavailable — proceed unauthenticated
+      // localStorage unavailable or restricted
     }
+
+    // Set ready immediately on mount so the user never encounters a blank screen!
     setReady(true);
+
+    // Step 2: Background sync with /api/user (with 2s timeout)
+    (async () => {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 2000);
+        const res = await fetch("/api/user", {
+          credentials: "include",
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (res.ok) {
+          const { user: u, state } = (await res.json()) as {
+            user: User | null;
+            state: PersistedUserState | null;
+          };
+
+          if (!cancelled && u) {
+            setUser(u);
+            try {
+              window.localStorage.setItem(STORAGE_KEY, JSON.stringify(u));
+            } catch {}
+          }
+          if (!cancelled && state) {
+            setVoiceModeState(state.voiceMode);
+            setVoiceLanguageState(state.voiceLanguage);
+            setSpeechProviderState(state.speechProvider);
+            setVoiceCheckedState(state.voiceChecked);
+            setAccessibilityPrefsState(state.accessibilityPrefs);
+            setUserSkillsState(state.userSkills);
+            setCurrentLocationState(state.currentLocation);
+          }
+        }
+      } catch {
+        // Server fetch timed out or offline — safely using local state
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Debounced write-back of the persisted slice (replaces the old
+  // per-setter localStorage.setItem calls).
+  useEffect(() => {
+    if (!ready) return;
+    const t = setTimeout(() => {
+      const state: PersistedUserState = {
+        voiceMode,
+        voiceLanguage,
+        speechProvider,
+        voiceChecked,
+        accessibilityPrefs,
+        userSkills,
+        currentLocation,
+      };
+      fetch("/api/user", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ user, state }),
+      }).catch(() => {});
+    }, 400);
+    return () => clearTimeout(t);
+  }, [
+    ready,
+    user,
+    voiceMode,
+    voiceLanguage,
+    speechProvider,
+    voiceChecked,
+    accessibilityPrefs,
+    userSkills,
+    currentLocation,
+  ]);
 
   // Apply visual accessibility preferences to document root
   useEffect(() => {
@@ -132,15 +261,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (accessibilityPrefs.largeText) root.classList.add("large-text");
       else root.classList.remove("large-text");
 
-      if (accessibilityPrefs.reducedMotion) root.classList.add("reduced-motion");
+      if (accessibilityPrefs.reducedMotion)
+        root.classList.add("reduced-motion");
       else root.classList.remove("reduced-motion");
     }
   }, [accessibilityPrefs]);
 
+  // Setters just update state; the debounced effect above syncs to /api/user.
   const persist = (next: User | null) => {
     setUser(next);
-    if (next) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    else window.localStorage.removeItem(STORAGE_KEY);
+    try {
+      if (next) {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      } else {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {}
   };
 
   const setVoiceMode = (active: boolean) => {
@@ -150,49 +286,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
       interactionMode: active ? "voice" : "text",
       speechOutput: active,
     }));
-    try {
-      window.localStorage.setItem(VOICE_MODE_KEY, String(active));
-    } catch {}
   };
 
-  const setVoiceLanguage = (lang: string) => {
-    setVoiceLanguageState(lang);
-    try {
-      window.localStorage.setItem(VOICE_LANG_KEY, lang);
-    } catch {}
-  };
+  const setVoiceLanguage = (lang: string) => setVoiceLanguageState(lang);
 
-  const setVoiceChecked = (checked: boolean) => {
-    setVoiceCheckedState(checked);
-    try {
-      window.localStorage.setItem(VOICE_CHECKED_KEY, String(checked));
-    } catch {}
-  };
+  const setVoiceChecked = (checked: boolean) => setVoiceCheckedState(checked);
 
   const setAccessibilityPrefs = (prefs: Partial<AccessibilityPreferences>) => {
-    setAccessibilityPrefsState((prev) => {
-      const next = { ...prev, ...prefs };
-      try {
-        window.localStorage.setItem(ACCESS_PREFS_KEY, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
+    setAccessibilityPrefsState((prev) => ({ ...prev, ...prefs }));
   };
 
-  const setCurrentLocation = (loc: string | null) => {
+  const setCurrentLocation = (loc: string | null) =>
     setCurrentLocationState(loc);
-    try {
-      if (loc) window.localStorage.setItem(LOCATION_KEY, loc);
-      else window.localStorage.removeItem(LOCATION_KEY);
-    } catch {}
-  };
 
-  const setUserSkills = (skills: string[]) => {
-    setUserSkillsState(skills);
-    try {
-      window.localStorage.setItem(USER_SKILLS_KEY, JSON.stringify(skills));
-    } catch {}
-  };
+  const setUserSkills = (skills: string[]) => setUserSkillsState(skills);
 
   const setMissingSkills = (skills: string[]) => {
     setMissingSkillsState(skills);
@@ -233,7 +340,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   };
 
   /** Google sign-in — upserts Google profile to DB then persists locally. */
-  const signInWithGoogle = async (name: string, email: string, picture?: string) => {
+  const signInWithGoogle = async (
+    name: string,
+    email: string,
+    picture?: string,
+  ) => {
     const localUser: User = {
       name,
       email,
@@ -262,7 +373,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   };
 
   /** GitHub sign-in — upserts GitHub profile to DB then persists locally. */
-  const signInWithGithub = async (name: string, email: string, picture?: string) => {
+  const signInWithGithub = async (
+    name: string,
+    email: string,
+    picture?: string,
+  ) => {
     const localUser: User = {
       name: name || email.split("@")[0],
       email,
@@ -321,7 +436,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const signOut = () => persist(null);
+  const signOut = () => {
+    persist(null);
+    fetch("/api/user", { method: "DELETE", credentials: "include" }).catch(
+      () => {},
+    );
+  };
 
   const setTargetRole = (role: RoleId) => {
     if (!user) return;
@@ -330,9 +450,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // Sync role to DB
     if (user.dbId) {
       updateUserRole(user.dbId, role).catch((e) =>
-        console.warn("[auth] updateUserRole failed:", e)
+        console.warn("[auth] updateUserRole failed:", e),
       );
     }
+  };
+
+  const setSpeechProvider = (provider: SpeechProviderType) =>
+    setSpeechProviderState(provider);
+
+  const setConversationLanguageState = (
+    state: Partial<ConversationLanguageState>,
+  ) => {
+    setConversationLanguageStateState((prev) => ({ ...prev, ...state }));
   };
 
   return (
@@ -348,12 +477,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setTargetRole,
         voiceMode,
         voiceLanguage,
+        speechProvider,
         voiceChecked,
         accessibilityPrefs,
+        conversationLanguageState,
         setVoiceMode,
         setVoiceLanguage,
+        setSpeechProvider,
         setVoiceChecked,
         setAccessibilityPrefs,
+        setConversationLanguageState,
         currentLocation,
         setCurrentLocation,
         userSkills,

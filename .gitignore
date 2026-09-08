@@ -13,4 +13,7 @@ tsconfig.tsbuildinfo
 cloudflared*
 .claude/
 careerforge/start-tunnel.js
-
+__pycache__/
+*.pyc
+*.pyo
+*.lnk

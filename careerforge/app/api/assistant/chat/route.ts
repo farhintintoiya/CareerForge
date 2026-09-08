@@ -12,6 +12,8 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { spawn } from "child_process";
+import path from "path";
 import { parseIntent, FeatureId, ResumeTab } from "@/lib/intent";
 import { AGENT_TOOLS_DEFINITIONS, AgentToolName } from "@/lib/agentTools";
 import { processResumeStepInput, ResumeDraftState } from "@/lib/conversationalResume";
@@ -36,6 +38,11 @@ interface RequestBody {
   };
   targetRole?: string;
   voiceMode?: boolean;
+  language?: string;
+  conversationLanguageState?: {
+    detectedLanguage?: string;
+    preferredLanguage?: string;
+  };
   currentPage?: string; // e.g. "assistant", "resume", "roadmap", "courses", "practice", "local"
   currentEntity?: {
     type?: "resume" | "job" | "course" | "roadmap" | "practice";
@@ -46,14 +53,282 @@ interface RequestBody {
   accessibilityPrefs?: {
     interactionMode?: "voice" | "text" | "hybrid";
     speechOutput?: boolean;
+    voiceNavigation?: boolean;
     visualResponses?: boolean;
     simplifiedLanguage?: boolean;
+    captions?: boolean;
     screenReaderMode?: boolean;
     highContrast?: boolean;
     largeText?: boolean;
     reducedMotion?: boolean;
   };
   resumeDraftState?: ResumeDraftState;
+}
+
+/**
+ * Call Python AI Assistant Engine:
+ * 1. Queries running FastAPI server on http://127.0.0.1:8000/api/chat
+ * 2. Falls back to direct Python CLI execution via run_cli.py
+ */
+async function callPythonAIEngine(body: RequestBody): Promise<any> {
+  // Step 1: Fast HTTP call to Python FastAPI backend
+  try {
+    const res = await fetch("http://127.0.0.1:8000/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.reply) {
+        return data;
+      }
+    }
+  } catch (httpErr) {
+    // FastAPI server not listening or starting up; proceed to CLI fallback
+  }
+
+  // Step 2: Direct Python CLI Subprocess Execution
+  return new Promise((resolve) => {
+    try {
+      const scriptPath = path.join(process.cwd(), "python_ai", "run_cli.py");
+      const py = spawn("python", [scriptPath]);
+      let stdout = "";
+
+      py.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+
+      py.on("close", (code) => {
+        if (code === 0 && stdout.trim()) {
+          try {
+            const parsed = JSON.parse(stdout);
+            resolve(parsed);
+            return;
+          } catch (e) {}
+        }
+        resolve(null);
+      });
+
+      py.on("error", () => resolve(null));
+
+      py.stdin.write(JSON.stringify(body));
+      py.stdin.end();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+// ─── Auth & Login Dedicated Co-Pilot Engine ──────────────────────────────────
+function handleAuthAndLoginIntent(
+  rawQuery: string,
+  userName: string,
+  voiceMode: boolean,
+  currentPage: string
+): { reply: string; engine: string; suggestions: string[] } | null {
+  const q = rawQuery.toLowerCase().trim();
+  if (!q) return null;
+
+  const isGujarati =
+    /[\u0A80-\u0AFF]/.test(rawQuery) ||
+    /\b(kem cho|maru naam|tamaru naam|mane madad|shu karvu|shu chhe|sikhavo|shikho|shikhvu|kevi rite|karvi|aabhar|joiye|nathi|chhu|chhe|avjo|saras|khub|banavva|madad karo|કેમ છો|નમસ્તે|શું|રેઝ્યૂમે|રોડમેપ|લોગિન|સાઇન|પ્રવેશ)\b/i.test(q);
+
+  const isHindi =
+    /[\u0900-\u097F]/.test(rawQuery) ||
+    /\b(kaise ho|namaste|mera naam|aapka naam|madad chahiye|kya karu|kya karna|batao|kripya|dhanyawad|shukriya|accha|theek|नमस्ते|कैसे|क्या|सहायता|नौकरी|लॉगिन|साइन|प्रवेश)\b/i.test(q);
+
+  const isFrench =
+    /[éèêëàâîïôûùç]/i.test(rawQuery) ||
+    /\b(bonjour|connexion|connecter|compte|mot de passe|invite|aide|comment)\b/i.test(q);
+
+  const isAuthContext =
+    currentPage === "auth" ||
+    currentPage === "login" ||
+    currentPage === "signup" ||
+    q.includes("login") ||
+    q.includes("log in") ||
+    q.includes("sign in") ||
+    q.includes("signin") ||
+    q.includes("sign up") ||
+    q.includes("signup") ||
+    q.includes("create account") ||
+    q.includes("guest") ||
+    q.includes("demo") ||
+    q.includes("password") ||
+    q.includes("what is careerforge") ||
+    q.includes("about careerforge");
+
+  if (!isAuthContext) return null;
+
+  // 1. Guest / Demo Intent
+  const isGuest =
+    q.includes("guest") ||
+    q.includes("demo") ||
+    q.includes("without account") ||
+    q.includes("without login") ||
+    q.includes("no account") ||
+    q.includes("candidate demo") ||
+    q.includes("free access") ||
+    q.includes("bypass") ||
+    q.includes("ગેસ્ટ") ||
+    q.includes("गेस्ट");
+
+  if (isGuest) {
+    if (isGujarati) {
+      return {
+        reply: voiceMode
+          ? "તમે પાસવર્ડ કે સાઇન-અપ વગર સીધા પ્રવેશ માટે નીચે 'Explore Platform as Guest' બટન દબાવી શકો છો."
+          : "### 🚀 ત્વરિત ગેસ્ટ એક્સેસ (કેન્ડિડેટ ડેમો)\n\nકોઈ વિગતો ભર્યા વગર તરત પ્રવેશ મેળવવા માટે કાર્ડના નીચે આપેલા **'Explore Platform as Guest (Candidate Demo)'** બટન પર ક્લિક કરો!\n\n• **૧-ક્લિક સીધો પ્રવેશ**: પાસવર્ડ કે ઇમેઇલ વગર સીધા વર્કસ્પેસમાં પ્રવેશ કરો.\n• **સંપૂર્ણ સુવિધાઓ**: રેઝ્યૂમે બિલ્ડર, સ્કિલ ગેપ એનાલિસિસ, લર્નિંગ રોડમેપ અને જોબ મેચિંગ.\n• **કોઈ પાસવર્ડ કે ફોનની જરૂર નથી**.",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Explore as Guest", "How to Sign In", "What is CareerForge?"],
+      };
+    }
+    if (isHindi) {
+      return {
+        reply: voiceMode
+          ? "आप बिना किसी पासवर्ड के तुरंत प्रवेश के लिए नीचे 'Explore Platform as Guest' बटन पर क्लिक कर सकते हैं।"
+          : "### 🚀 तुरंत गेस्ट एक्सेस (कैंडिडेट डेमो)\n\nआपको कोई क्रेडेंशियल दर्ज करने की आवश्यकता नहीं है! बस कार्ड के नीचे **'Explore Platform as Guest (Candidate Demo)'** बटन पर क्लिक करें।\n\n• **1-क्लिक प्रवेश**: तुरंत बिना पासवर्ड के वर्कस्पेस में प्रवेश करें।\n• **सभी फीचर्स उपलब्ध**: रेज़्यूमे एनालाइज़र, करियर रोडमैप, कोर्सेज और जॉब मैचिंग।\n• **पासवर्ड की ज़रूरत नहीं**: बिना किसी रुकावट के पूरा प्लेटफ़ॉर्म देखें।",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Explore as Guest", "Sign in help", "What is CareerForge?"],
+      };
+    }
+    return {
+      reply: voiceMode
+        ? "You can click Explore Platform as Guest at the bottom of the card for instant one-click access without any credentials."
+        : "### 🚀 Instant Candidate Demo (Guest Access)\n\nYou don't need to type any credentials! Simply click the **'Explore Platform as Guest (Candidate Demo)'** button at the bottom of the card.\n\n• **Instant 1-Click Entry**: Automatically sets up a candidate demo workspace.\n• **Full Feature Access**: Explore the Resume Builder, Skill Gap Analyzer, Learning Roadmaps, and Job Matcher.\n• **Zero Setup**: No password, phone number, or verification code needed!",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Explore as Guest", "How to Sign In", "Create Account", "What is CareerForge?"],
+    };
+  }
+
+  // 2. Sign Up / Create Account Intent
+  const isSignUp =
+    q.includes("create account") ||
+    q.includes("sign up") ||
+    q.includes("signup") ||
+    q.includes("register") ||
+    q.includes("new account") ||
+    q.includes("make an account") ||
+    q.includes("નવું એકાઉન્ટ") ||
+    q.includes("નવું ખાતું") ||
+    q.includes("नया खाता");
+
+  if (isSignUp) {
+    if (isGujarati) {
+      return {
+        reply: voiceMode
+          ? "નવું ખાતું બનાવવા માટે કાર્ડની ટોચ પર 'Create account' ટેબ પસંદ કરો અને તમારું નામ, ઇમેઇલ અને ૬ અક્ષરનો પાસવર્ડ દાખલ કરો."
+          : "### નવું ખાતું કેવી રીતે બનાવવું 📝\n\n1. કાર્ડની ટોચ પર **'Create account'** ટેબ પર ક્લિક કરો.\n2. તમારું **પૂરું નામ** દાખલ કરો (અથવા 'Speak Name' ક્લિક કરો).\n3. તમારું **ઇમેઇલ સરનામું** દાખલ કરો.\n4. ઓછામાં ઓછા ૬ અક્ષરનો સુરક્ષિત **પાસવર્ડ** દાખલ કરો.\n5. તમારું વર્કસ્પેસ શરૂ કરવા **'Create account'** બટન પર ક્લિક કરો!",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Switch to Create Account", "Explore as Guest", "What is CareerForge?"],
+      };
+    }
+    if (isHindi) {
+      return {
+        reply: voiceMode
+          ? "नया खाता बनाने के लिए ऊपर 'Create account' टैब चुनें, अपना नाम, ईमेल और कम से कम 6 अक्षरों का पासवर्ड दर्ज करें।"
+          : "### नया खाता कैसे बनाएँ 📝\n\n1. कार्ड के शीर्ष पर **'Create account'** टैब पर क्लिक करें।\n2. अपना **पूरा नाम** दर्ज करें (या 'Speak Name' पर क्लिक करें)।\n3. अपना **ईमेल पता** दर्ज करें।\n4. कम से कम 6 अक्षरों का **पासवर्ड** निर्धारित करें।\n5. अपना डैशबोर्ड शुरू करने के लिए **'Create account'** पर क्लिक करें!",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Switch to Create Account", "Explore as Guest", "What is CareerForge?"],
+      };
+    }
+    return {
+      reply: voiceMode
+        ? "To create an account, click the Create account tab at the top of the card, enter your name, email, and a password of at least 6 characters, then click Create account."
+        : "### How to Create a New Account 📝\n\n1. Click the **'Create account'** tab at the top of the auth card.\n2. Enter your **Full Name** (or click 'Speak Name' to dictate).\n3. Enter your **Email Address**.\n4. Set a secure **Password** of at least 6 characters.\n5. Click **'Create account'** to immediately enter your personalized CareerForge workspace!",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Switch to Create Account", "Explore as Guest", "How to Sign In"],
+    };
+  }
+
+  // 3. Password Help Intent
+  const isPassword =
+    q.includes("password") ||
+    q.includes("forgot") ||
+    q.includes("pin") ||
+    q.includes("passcode") ||
+    q.includes("પાસવર્ડ") ||
+    q.includes("पासवर्ड");
+
+  if (isPassword) {
+    return {
+      reply: voiceMode
+        ? "Passwords must be at least 6 characters long. You can click Show to check what you typed, or click Explore Platform as Guest to skip entering a password."
+        : "### Password Guidance & Help 🔐\n\n• **Minimum Length**: Passwords must be at least **6 characters** long.\n• **Show/Hide**: Click the **'Show'** / **'Hide'** link above the password box to verify your input.\n• **Voice Input**: Click **'Speak Password'** to speak your PIN or password hands-free.\n• **Instant Bypass**: Click **'Explore Platform as Guest'** below to use CareerForge without entering any password!",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Explore as Guest", "How to Sign In", "Create Account"],
+    };
+  }
+
+  // 4. What is CareerForge / Overview Intent
+  const isOverview =
+    q.includes("what is careerforge") ||
+    q.includes("about careerforge") ||
+    q.includes("what does this app do") ||
+    q.includes("what can i do here") ||
+    q.includes("features") ||
+    q.includes("how does careerforge work") ||
+    q.includes("કરિયરફોર્જ શું છે") ||
+    q.includes("करियरफोर्ज क्या है");
+
+  if (isOverview) {
+    if (isGujarati) {
+      return {
+        reply: voiceMode
+          ? "કરિયરફોર્જ એક આર્ટિફિશિયલ ઇન્ટેલિજન્સ કરિયર પ્લેટફોર્મ છે જે રેઝ્યૂમે ઓડિટ, સ્કિલ ગેપ રોડમેપ અને નોકરીઓ શોધવામાં મદદ કરે છે."
+          : "### કરિયરફોર્જમાં આપનું સ્વાગત છે 🧭\n\n**કરિયરફોર્જ (CareerForge)** એ એક આધુનિક AI પ્લેટફોર્મ છે જે તમારી કરિયર વૃદ્ધિ માટે રચાયેલ છે:\n\n• 📄 **રેઝ્યૂમે ઇન્ટેલિજન્સ**: વાતચીત દ્વારા રેઝ્યૂમે બનાવટ અને ATS સ્કોરિંગ.\n• 🗺️ **કરિયર રોડમેપ**: તમારા લક્ષિત જોબ રોલ માટે કદમ-દર-કદમ માર્ગદર્શન.\n• 🎓 **કોર્સ અને પ્રોજેક્ટ્સ**: તમારી ખૂટતી સ્કિલ્સ માટે શ્રેષ્ઠ લર્નિંગ રિસોર્સિસ.\n• 💼 **જોબ મેચિંગ**: લોકેશન મુજબ લાઈવ વેરિફાઇડ નોકરીઓ.\n• 🎙️ **વોઇસ એક્સેસિબિલિટી**: ૧૦૦% હેન્ડ્સ-ફ્રી અવાજ નેવિગેશન.\n\nહમણાં જ શરૂ કરવા માટે નીચે **'Explore Platform as Guest'** પર ક્લિક કરો!",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Explore as Guest", "How to Sign In", "Create Account"],
+      };
+    }
+    if (isHindi) {
+      return {
+        reply: voiceMode
+          ? "करियरफोर्ज एक AI करियर को-पायलट है जो रेज़्यूमे बनाने, कौशल कमियों की पहचान करने, करियर रोडमैप तैयार करने और लाइव नौकरियां खोजने में मदद करता है।"
+          : "### करियरफोर्ज में आपका स्वागत है 🧭\n\n**CareerForge** एक व्यापक AI करियर को-पायलट और एक्सेसिबिलिटी वर्कस्पेस है:\n\n• 📄 **रेज़्यूमे निर्माण और ऑडिट**: ATS स्कोरिंग और चरणबद्ध रेज़्यूमे गाइडेंस।\n• 🗺️ **डायनामिक रोडमैप**: आपके लक्षित रोल के लिए स्पष्ट कौशल विकास पथ।\n• 🎓 **क्यूरेटेड कोर्सेज व प्रोजेक्ट्स**: उद्योग स्तर के हैंड्स-ऑन प्रोजेक्ट्स।\n• 💼 **लाइव जॉब मैचिंग**: सत्यापित स्थानीय और रिमोट नौकरियां।\n• 🎙️ **हैंड्स-फ्री वॉइस नेविगेशन**: बहुभाषी आवाज़ नियंत्रण (हिंदी, गुजराती, अंग्रेज़ी)।\n\nतुरंत आज़माने के लिए नीचे **'Explore Platform as Guest'** पर क्लिक करें!",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Explore as Guest", "How to Sign In", "Create Account"],
+      };
+    }
+    return {
+      reply: voiceMode
+        ? "CareerForge is an AI career co-pilot that audits resumes, maps missing skills to target roles, provides learning roadmaps, and matches live jobs."
+        : "### Welcome to CareerForge 🧭\n\n**CareerForge** is an AI Career Co-Pilot and Accessibility Workspace engineered to guide you from where you are to where you want to be:\n\n• 📄 **Conversational Resume Engineering**: Real-time ATS scoring, keyword gap detection, and guided step-by-step builders.\n• 🗺️ **Adaptive Skill Roadmaps**: Milestone trees dynamically aligned with your target dream job.\n• 🎓 **Curated Learning & Projects**: High-impact courses and portfolio project blueprints for missing skills.\n• 💼 **Live Verified Opportunities**: Real-time matching for local and remote positions.\n• 🎙️ **Universal Accessibility**: 100% hands-free voice navigation and multilingual support.\n\nClick **'Explore Platform as Guest'** below to test the full experience immediately!",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Explore as Guest", "How to Sign In", "Create Account"],
+    };
+  }
+
+  // 5. Default General Login / Sign In Guidance
+  if (isGujarati) {
+    return {
+      reply: voiceMode
+        ? "કરિયરફોર્જમાં પ્રવેશવા માટે તમારું ઇમેઇલ અને પાસવર્ડ દાખલ કરો, અથવા પાસવર્ડ વગર તરત પ્રવેશવા 'Explore Platform as Guest' ક્લિક કરો."
+        : "### કરિયરફોર્જમાં સાઇન ઇન કેવી રીતે કરવું 🔑\n\nતમારી પાસે પ્રવેશવા માટેના સરળ વિકલ્પો છે:\n\n1. **⚡ ગેસ્ટ તરીકે પ્રવેશ (સૌથી ઝડપી)**: ૧-ક્લિક સીધા પ્રવેશ માટે નીચે **'Explore Platform as Guest'** બટન ક્લિક કરો!\n2. **📧 ઇમેઇલ અને પાસવર્ડ**: તમારો ઇમેઇલ અને પાસવર્ડ (ઓછામાં ઓછા ૬ અક્ષર) દાખલ કરી **'Sign in'** દબાવો.\n3. **📝 નવું ખાતું**: ઉપર **'Create account'** ટેબ પર ક્લિક કરીને નોંધણી કરો.\n4. **🌐 સોશિયલ સાઇન-ઇન**: Google, GitHub અથવા Phone વડે એક ક્લિકમાં લોગિન કરો.\n5. **🎙️ બોલીને લખો**: દરેક ફીલ્ડ પાસે રહેલા 'Speak' બટન દબાવી બોલીને લખી શકો છો.",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Explore as Guest", "Create Account", "Help with Voice Dictation"],
+    };
+  }
+
+  if (isHindi) {
+    return {
+      reply: voiceMode
+        ? "करियरफोर्ज में प्रवेश के लिए अपना ईमेल और पासवर्ड दर्ज करें, या बिना पासवर्ड के तुरंत 1-क्लिक एक्सेस के लिए 'Explore Platform as Guest' दबाएँ।"
+        : "### करियरफोर्ज में साइन इन कैसे करें 🔑\n\nयहाँ आपके लिए त्वरित विकल्प हैं:\n\n1. **⚡ तुरंत गेस्ट एक्सेस (सबसे तेज़)**: 1-क्लिक बिना पासवर्ड एक्सेस के लिए नीचे **'Explore Platform as Guest'** पर क्लिक करें!\n2. **📧 ईमेल और पासवर्ड**: अपना ईमेल और कम से कम 6 अक्षरों का पासवर्ड दर्ज करके **'Sign in'** पर क्लिक करें।\n3. **📝 नया खाता बनाएँ**: ऊपर **'Create account'** टैब चुनकर नया खाता बनाएँ।\n4. **🌐 सोशल लॉगिन**: Google, GitHub या Phone का उपयोग करें।\n5. **🎙️ वॉइस डिक्टेशन**: फील्ड के पास 'Speak' बटन दबाकर बोलकर इनपुट दें।",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Explore as Guest", "Create Account", "Help with Voice Dictation"],
+    };
+  }
+
+  return {
+    reply: voiceMode
+      ? "To sign in, enter your email and password, or click Explore Platform as Guest below for instant one-click access without entering any credentials."
+      : "### How to Sign In to CareerForge 🔑\n\nHere are the fastest ways to access your workspace:\n\n1. **⚡ Instant Guest Access (Recommended)**:\n   Click the **'Explore Platform as Guest (Candidate Demo)'** button below for 1-click entry—no credentials required!\n\n2. **📧 Email & Password**:\n   Enter your registered **Email Address** and **Password** (min. 6 characters), then click **'Sign in'**.\n\n3. **📝 Need an Account?**:\n   Click the **'Create account'** tab at the top of the card to register your name, email, and password.\n\n4. **🌐 Social & Phone Logins**:\n   Quickly authenticate using **Google**, **GitHub**, or **Phone**.\n\n5. **🎙️ Hands-Free Voice Dictation**:\n   Click **'Speak Email'** or **'Speak Password'** to speak your credentials safely.",
+    engine: "CareerForge Auth Co-Pilot",
+    suggestions: ["Explore as Guest", "Create Account", "Password Help", "What is CareerForge?"],
+  };
 }
 
 export async function POST(req: NextRequest) {
@@ -80,6 +355,29 @@ export async function POST(req: NextRequest) {
       (userProfile?.email ? userProfile.email.split("@")[0] : "Candidate");
     const role = targetRole || userProfile?.targetRole || "Software Engineer";
 
+    // ─── Direct Auth & Login Co-Pilot Fast Path ───────────────────────────────
+    const authDirectReply = handleAuthAndLoginIntent(lastMessage, userName, !!voiceMode, currentPage);
+    if (authDirectReply) {
+      return NextResponse.json({
+        ...authDirectReply,
+        thinking: [
+          `🔐 1. Authentication Intent recognized for page context '${currentPage}'.`,
+          `📋 2. Delivering tailored sign-in guidance and 1-click candidate guest demo options.`,
+          `✨ 3. Voice mode is ${voiceMode ? "ACTIVE (Concise spoken response)" : "OFF (Full formatted markdown)"}.`,
+        ],
+      });
+    }
+
+    // ─── 0. Primary Cognitive Engine: Python AI Assistant Brain ───────────────
+    try {
+      const pythonResponse = await callPythonAIEngine(body);
+      if (pythonResponse && pythonResponse.reply && pythonResponse.reply.trim().length > 10) {
+        return NextResponse.json(pythonResponse);
+      }
+    } catch (pyErr) {
+      console.warn("[Assistant API] Python AI Brain error:", pyErr);
+    }
+
     // ─── 1. Try Groq Cloud (Llama 3.3 70B / DeepSeek R1) ──────────────────────
     const groqKey = process.env.GROQ_API_KEY;
     if (groqKey && groqKey.trim().length > 5) {
@@ -95,7 +393,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (groqResponse && groqResponse.reply && groqResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...groqResponse, engine: "Groq (Llama 3.3 70B)" });
+          return NextResponse.json({
+            ...groqResponse,
+            thinking: (groqResponse as any).thinking || [
+              `🧠 1. Intent Analysis: Deeply analyzing the query and conversational context for ${userName}.`,
+              `🔍 2. Frontier Reasoning: Generating nuanced insight via Llama 3.3 70B cognitive architecture.`,
+              `💡 3. Conceptual & Empathy Alignment: Framing with intuitive analogies and empathetic warmth.`,
+              `✨ 4. Structured Synthesis: Formatting reply with clarity, warmth, and depth.`,
+            ],
+            engine: "Groq (Llama 3.3 70B)",
+          });
         }
       } catch (groqErr) {
         console.warn("[Assistant API] Groq error:", groqErr);
@@ -117,7 +424,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (geminiResponse && geminiResponse.reply && geminiResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...geminiResponse, engine: "Google Gemini 1.5 Flash" });
+          return NextResponse.json({
+            ...geminiResponse,
+            thinking: (geminiResponse as any).thinking || [
+              `🧠 1. Intent Analysis: Deconstructing curiosity and underlying goals for ${userName}.`,
+              `🔍 2. Multimodal Knowledge Grounding: Verifying factual principles via Gemini 1.5 Flash.`,
+              `💡 3. Empathy & Analogy Synthesis: Infusing warmth, intuitive metaphors, and feeling.`,
+              `✨ 4. Refined Output: Delivering clear, empowering, and actionable response.`,
+            ],
+            engine: "Google Gemini 1.5 Flash",
+          });
         }
       } catch (geminiErr) {
         console.warn("[Assistant API] Gemini error:", geminiErr);
@@ -139,7 +455,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (openaiResponse && openaiResponse.reply && openaiResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...openaiResponse, engine: "OpenAI GPT-4o-mini" });
+          return NextResponse.json({
+            ...openaiResponse,
+            thinking: (openaiResponse as any).thinking || [
+              `🧠 1. Cognitive Framing: Analyzing intent and emotional nuance for ${userName}.`,
+              `🔍 2. Model Reasoning: Deliberating across knowledge domains with GPT-4o-mini.`,
+              `💡 3. Empathy & Tone Calibration: Formulating intuitive real-world analogies with human feeling.`,
+              `✨ 4. Output Crafting: Polishing tone for maximum clarity, encouragement, and warmth.`,
+            ],
+            engine: "OpenAI GPT-4o-mini",
+          });
         }
       } catch (openaiErr) {
         console.warn("[Assistant API] OpenAI error:", openaiErr);
@@ -161,7 +486,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (orResponse && orResponse.reply && orResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...orResponse, engine: "OpenRouter (DeepSeek R1 / LLaMA 3.3)" });
+          return NextResponse.json({
+            ...orResponse,
+            thinking: (orResponse as any).thinking || [
+              `🧠 1. Query Analysis: Dissecting user intention and conversational background.`,
+              `🔍 2. OpenRouter Reasoning: Synthesizing deep perspective via frontier open models.`,
+              `💡 3. Intuitive Clarity: Enriching response with relatable examples and empathetic warmth.`,
+              `✨ 4. Delivery: Assembling polished, engaging Markdown response.`,
+            ],
+            engine: "OpenRouter (DeepSeek R1 / LLaMA 3.3)",
+          });
         }
       } catch (orErr) {
         console.warn("[Assistant API] OpenRouter error:", orErr);
@@ -183,7 +517,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (ghResponse && ghResponse.reply && ghResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...ghResponse, engine: "GitHub Models (GPT-4o)" });
+          return NextResponse.json({
+            ...ghResponse,
+            thinking: (ghResponse as any).thinking || [
+              `🧠 1. Intent Sensing: Examining user inquiry and technical or conceptual context.`,
+              `🔍 2. Inference Architecture: Reasoning with GitHub Models (GPT-4o).`,
+              `💡 3. Metaphor & Empathy: Crafting accessible explanations with authentic human touch.`,
+              `✨ 4. Final Polish: Structuring response with genuine warmth and depth.`,
+            ],
+            engine: "GitHub Models (GPT-4o)",
+          });
         }
       } catch (ghErr) {
         console.warn("[Assistant API] GitHub Models error:", ghErr);
@@ -203,7 +546,17 @@ export async function POST(req: NextRequest) {
       accessibilityPrefs,
       resumeDraftState
     );
-    return NextResponse.json({ ...dynamicResponse, engine: "CareerForge Autonomous AI Brain" });
+    const defaultCognitiveThinking = [
+      `🧠 1. Deconstructing Intent & Nuance: Analyzing '${lastMessage.slice(0, 45)}' to address both factual and human curiosity.`,
+      `🔍 2. Knowledge Grounding: Verifying core mechanisms and practical relevance for role '${role}'.`,
+      `💡 3. Intuitive Metaphor & Empathy: Calibrating warm, empathetic delivery with relatable real-world framing.`,
+      `✨ 4. Calibrating Narrative Arc: Formatting structured, engaging answer with feeling, warmth, and depth.`,
+    ];
+    return NextResponse.json({
+      ...dynamicResponse,
+      thinking: (dynamicResponse as any).thinking || defaultCognitiveThinking,
+      engine: "CareerForge Autonomous AI Brain",
+    });
   } catch (error) {
     console.error("[Assistant API] Error:", error);
     return NextResponse.json(
@@ -241,8 +594,12 @@ Core Directives & Behavioral Guidelines:
      - "I can't hear you" → Switch to visual responses with speech output disabled.
      - "Typing is difficult" → Offer voice dictation and speech form filling.
      - "These questions are difficult" → Use simpler, shorter language.
-4. TONE & PERSONALITY: Extremely friendly, warm, patient, encouraging, respectful, simple, and professional. Never patronizing. Reduce anxiety around career and tech.
-5. VOICE CONCISENESS: ${voiceMode ? "Keep replies punchy (2-4 clear sentences) and easy to listen to." : "Provide structured, readable markdown with bullet points where appropriate."}
+4. TONE, PERSONALITY & FEELING (CLAUDE & CHATGPT CALIBER):
+   - Never give sterile, robotic, or dry dictionary definitions. 
+   - Radiate genuine human warmth, emotional intelligence, empathy, patience, and intellectual curiosity.
+   - For any question, think about the underlying curiosity or human feeling: illuminate the 'big picture' first using vivid, intuitive analogies before gracefully breaking down the core mechanics.
+   - When addressing career or tech challenges, be profoundly encouraging, calming anxiety and empowering the user.
+5. VOICE CONCISENESS: ${voiceMode ? "Keep replies punchy (2-4 clear, warm sentences) and easy to listen to." : "Provide structured, beautifully readable markdown with intuitive metaphors and clear bullet points where appropriate."}
 6. CONFIRMATION ON CRITICAL FIELDS: Always confirm spoken contact info (email address) before finalizing. Never submit a job application without explicit user confirmation.
 7. ACTION DIRECTIVES (Append on its own final line ONLY when triggering a tool):
    - [ACTION: {"tool": "navigateTo", "page": "resume" | "roadmap" | "courses" | "practice" | "local", "tab": "analyzer" | "personalizer" | "builder"}]
@@ -541,26 +898,157 @@ function generateCognitiveAgentResponse(
     /[ñáéíóú¿¡]/i.test(query) ||
     /\b(hola|como estas|ayuda|gracias|por favor|mi nombre|buenos dias|buenas tardes|trabajo|empleo)\b/i.test(lower);
 
+  const authDirect = handleAuthAndLoginIntent(query, userName, voiceMode, currentPage);
+  if (authDirect) {
+    return authDirect;
+  }
+
+  // ─── 0. Voice Onboarding Step 1: User Chooses Voice Mode ("Voice")
+  const lastAssistantMsg =
+    messages
+      .slice()
+      .reverse()
+      .find((m) => m.role === "assistant")?.text.toLowerCase() || "";
+
+  if (
+    lower === "voice" ||
+    lower === "voice mode" ||
+    lower === "use voice" ||
+    lower === "speak" ||
+    lower === "voix" ||
+    lower === "અવાજ" ||
+    lower === "आवाज़"
+  ) {
+    const reply = isFrench
+      ? "Super ! Je vais vous guider pas à pas. Vous pouvez parler naturellement et vous pouvez m'interrompre à tout moment. Comment souhaitez-vous que je vous appelle ?"
+      : isGujarati
+      ? "સરસ! હું તમને એક-એક સ્ટેપ દ્વારા માર્ગદર્શન આપીશ. તમે કુદરતી રીતે બોલી શકો છો અને મને ગમે ત્યારે રોકી શકો છો. હું તમને શું કહીને બોલાવું?"
+      : isHindi
+      ? "शानदार! मैं आपको कदम दर कदम गाइड करूँगा। आप स्वाभाविक रूप से बोल सकते हैं और मुझे कभी भी रोक सकते हैं। मैं आपको किस नाम से बुलाऊं?"
+      : "Great! I'll guide you step by step. You can speak naturally, and you can interrupt me anytime. What would you like me to call you?";
+
+    return {
+      reply,
+      toolCall: {
+        tool: "updateAccessibilityPreferences",
+        parameters: { interactionMode: "voice", speechOutput: true },
+      },
+    };
+  }
+
+  // ─── 0b. Voice Onboarding Step 2: Name Response ("My name is Manan")
+  if (
+    (lastAssistantMsg.includes("call you") ||
+      lastAssistantMsg.includes("તમારું નામ") ||
+      lastAssistantMsg.includes("किस नाम") ||
+      lastAssistantMsg.includes("vous appelle")) &&
+    !lower.includes("resume") &&
+    !lower.includes("job")
+  ) {
+    const candidateName = query
+      .replace(/^(?:my name is|i am|call me|je m'appelle|maru naam|mera naam)\s*/i, "")
+      .replace(/[.,;?!]+$/, "")
+      .trim();
+
+    const nameToUse = candidateName || userName || "Candidate";
+    const reply = isFrench
+      ? `Ravi de vous rencontrer, ${nameToUse} ! Quel domaine ou métier vous intéresse ?`
+      : isGujarati
+      ? `તમને મળીને આનંદ થયો, ${nameToUse}! તમે કયા ક્ષેત્ર અથવા કરિયરમાં રસ ધરાવો છો?`
+      : isHindi
+      ? `आपसे मिलकर खुशी हुई, ${nameToUse}! आप किस प्रकार के करियर या पद में रुचि रखते हैं?`
+      : `Nice to meet you, ${nameToUse}. What kind of career are you interested in?`;
+
+    return {
+      reply,
+      toolCall: {
+        tool: "updateUserProfile",
+        parameters: { name: nameToUse },
+      },
+    };
+  }
+
+  // ─── 0c. Voice Onboarding Step 3: Career Track Response ("Frontend development")
+  if (
+    lastAssistantMsg.includes("what kind of career") ||
+    lastAssistantMsg.includes("métier vous intéresse") ||
+    lastAssistantMsg.includes("કરિયરમાં રસ") ||
+    lastAssistantMsg.includes("करियर या पद में रुचि")
+  ) {
+    const chosenRole = query.replace(/[.,;?!]+$/, "").trim();
+    const reply = isFrench
+      ? `Parfait pour ${chosenRole} ! Avez-vous déjà un CV, ou souhaitez-vous que je vous aide à en créer un ?`
+      : isGujarati
+      ? `સરસ! ${chosenRole} માટે ઉત્તમ. શું તમારી પાસે પહેલેથી જ રેઝ્યૂમે છે, કે પછી હું તમને નવું બનાવવામાં મદદ કરું?`
+      : isHindi
+      ? `बहुत बढ़िया! ${chosenRole} के लिए शानदार। क्या आपके पास पहले से कोई रेज़्यूमे है, या आप चाहते हैं कि मैं इसे बनाने में मदद करूँ?`
+      : `Great. Do you already have a resume, or would you like me to help you create one?`;
+
+    return {
+      reply,
+      toolCall: {
+        tool: "updateUserProfile",
+        parameters: { targetRole: chosenRole },
+      },
+    };
+  }
+
+  // ─── 0d. Natural Accessibility: "I don't want to use the mouse"
+  if (
+    lower.includes("don't want to use the mouse") ||
+    lower.includes("dont want to use the mouse") ||
+    lower.includes("no mouse") ||
+    lower.includes("without mouse") ||
+    lower.includes("hands free") ||
+    lower.includes("hands-free") ||
+    lower.includes("માઉસ નથી વાપરવું") ||
+    lower.includes("माउस का उपयोग नहीं करना") ||
+    lower.includes("pas de souris")
+  ) {
+    const reply = isFrench
+      ? "Absolument. Je vais vous guider sur le site à l'aide de la voix et des raccourcis clavier."
+      : isGujarati
+      ? "ચોક્કસ. હું તમને અવાજ અને કીબોર્ડ નેવિગેશન દ્વારા આખી વેબસાઇટ પર માર્ગદર્શન આપીશ."
+      : isHindi
+      ? "बिल्कुल। मैं आवाज़ और कीबोर्ड नेविगेशन के ज़रिये आपका पूरा मार्गदर्शन करूँगा।"
+      : "Absolutely. I'll guide you through the website using voice and keyboard.";
+
+    return {
+      reply,
+      toolCall: {
+        tool: "updateAccessibilityPreferences",
+        parameters: { voiceNavigation: true, speechOutput: true, interactionMode: "voice" },
+      },
+    };
+  }
+
   // ─── A. Conversational Resume Builder Mode (Active or Triggered)
   const isNoResume =
     lower.includes("don't have a resume") ||
     lower.includes("dont have a resume") ||
     lower.includes("do not have a resume") ||
     lower.includes("no resume") ||
+    lower.includes("don't have one") ||
+    lower.includes("dont have one") ||
     lower.includes("create one from scratch") ||
+    lower.includes("help me build one") ||
+    lower.includes("help me create one") ||
+    lower.includes("નથી") ||
     lower.includes("રેઝ્યૂમે નથી") ||
     lower.includes("रेज़्यूमे नहीं है") ||
-    lower.includes("pas de cv");
+    lower.includes("नहीं है") ||
+    lower.includes("pas de cv") ||
+    lower.includes("n'en ai pas");
 
   if (isNoResume) {
     const prompt =
       isFrench
-        ? "Pas de problème ! Nous allons créer votre CV ensemble, une étape à la fois. Tout d'abord, quel est votre nom complet ?"
+        ? "C'est tout à fait normal. Je vais vous aider à en créer un étape par étape. Tout d'abord, quel est votre nom complet ?"
         : isGujarati
-        ? "કોઈ ચિંતા નથી! ચાલો સાથે મળીને તમારું રેઝ્યૂમે એક-એક પ્રશ્ન દ્વારા બનાવીએ. સૌથી પહેલા, તમારું પૂરું નામ શું છે?"
+        ? "કોઈ ચિંતા નથી! હું તમને રેઝ્યૂમે બનાવવામાં મદદ કરીશ. સૌથી પહેલા, તમારું પૂરું નામ શું છે?"
         : isHindi
-        ? "कोई बात नहीं! आइए हम एक-एक सवाल के साथ आपका रेज़्यूमे बनाना शुरू करें। सबसे पहले, आपका पूरा नाम क्या है?"
-        : "No problem at all! Let's build your resume together step-by-step, one question at a time. First, what is your full name?";
+        ? "कोई बात नहीं! मैं आपको रेज़्यूमे बनाने में पूरी मदद करूँगा। सबसे पहले, आपका पूरा नाम क्या है?"
+        : "That's completely fine. I'll help you build one step-by-step. First, what is your full name?";
 
     return {
       reply: prompt,
