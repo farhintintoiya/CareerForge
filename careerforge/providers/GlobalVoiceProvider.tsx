@@ -168,13 +168,12 @@ export function GlobalVoiceProvider({ children }: { children: ReactNode }) {
     persistFallback(true);
   }, [persistFallback]);
 
-  const { voiceLanguage, setVoiceLanguage } = useApp();
+  const { user, voiceLanguage, setVoiceLanguage } = useApp();
 
   const voice = useVoiceCommand({
-    // Stay enabled through the probe itself, and afterward for as long as
-    // we're in voice mode. Once resolved to text mode, disable — the mic
-    // should not keep running in the background.
-    enabled: isPreferenceLoading || isVoiceMode,
+    // Only run autonomous background probe in the authenticated workspace.
+    // When on the login/auth gate (!user), leave the microphone free for AuthGate & GlobalVoiceDictator.
+    enabled: Boolean(user) && (isPreferenceLoading || isVoiceMode),
     lang: voiceLanguage || "en-US",
     onSpeechDetected: resolveAsVoiceMode,
     onFallbackTriggered: resolveAsTextMode,

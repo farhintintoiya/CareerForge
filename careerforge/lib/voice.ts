@@ -546,11 +546,8 @@ export function startSpeechRecognition(
     return null;
   }
 
-  // Safeguard 1: NEVER listen while AI is speaking or within 800ms post-speech echo cooldown
-  if (isSelfSpeaking || Date.now() - lastSpeechEndedAt < 800) {
-    console.warn("[Voice Guard] Cannot start speech recognition during AI speech or echo cooldown.");
-    callbacksOrOptions.onListeningChange?.(false);
-    return null;
+  if (isSelfSpeaking) {
+    stopSpeaking();
   }
 
   const isOptionsObject = "lang" in callbacksOrOptions || "continuous" in callbacksOrOptions || "isBlindGuide" in callbacksOrOptions;
@@ -583,6 +580,15 @@ export function startSpeechRecognition(
   const createAndStartInstance = () => {
     if (!running || isSelfSpeaking) return;
 
+    const remainingCooldown = 350 - (Date.now() - lastSpeechEndedAt);
+    if (remainingCooldown > 0) {
+      if (restartTimeout) clearTimeout(restartTimeout);
+      restartTimeout = setTimeout(() => {
+        if (running && !isSelfSpeaking) createAndStartInstance();
+      }, remainingCooldown);
+      return;
+    }
+
     try {
       const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       const recognition = new SpeechRecognitionClass();
@@ -598,8 +604,8 @@ export function startSpeechRecognition(
       };
 
       recognition.onresult = (event: any) => {
-        // Safeguard: If AI is speaking or in post-speech cooldown (800ms), drop
-        if (isSelfSpeaking || Date.now() - lastSpeechEndedAt < 800) {
+        // Safeguard: If AI is speaking or in post-speech cooldown (350ms), drop
+        if (isSelfSpeaking || Date.now() - lastSpeechEndedAt < 350) {
           return;
         }
 
@@ -627,7 +633,7 @@ export function startSpeechRecognition(
           currentLanguage = detected;
           onTranscript(cleanFinal, true);
         } else if (interim) {
-          if (!isSelfSpeaking && Date.now() - lastSpeechEndedAt >= 800) {
+          if (!isSelfSpeaking && Date.now() - lastSpeechEndedAt >= 350) {
             if (!isSelfVoiceEcho(interim)) {
               onTranscript(interim, false);
             }

@@ -243,6 +243,65 @@ function handleAuthAndLoginIntent(
     };
   }
 
+  // 2b. Form Step Guidance (Step 1 Name / Step 2 Email / Step 3 Password)
+  const isStep1 = q.includes("step 1") || (q.includes("step") && q.includes("one")) || (q.includes("name") && !q.includes("password"));
+  if (isStep1) {
+    if (isGujarati) {
+      return {
+        reply: voiceMode
+          ? "પગલું ૧: તમારું પૂરું નામ દાખલ કરો અથવા તમારું નામ બોલો."
+          : "### પગલું ૧: પૂરું નામ 👤\n\nતમારું પૂરું નામ 'Full Name' ફીલ્ડમાં લખો અથવા બોલીને ભરવા માટે 'Speak Name' બટન પર ક્લિક કરો. તે પછી તમે પગલું ૨ (ઇમેઇલ) પર જઈ શકો છો.",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Next: Step 2 Email", "Explore as Guest"],
+      };
+    }
+    if (isHindi) {
+      return {
+        reply: voiceMode
+          ? "चरण 1: अपना पूरा नाम दर्ज करें या बोलकर अपना नाम बताएँ।"
+          : "### चरण 1: पूरा नाम 👤\n\n'Full Name' बॉक्स में अपना नाम लिखें या बोलकर भरने के लिए 'Speak Name' पर क्लिक करें। इसके बाद चरण 2 (ईमेल) पर आगे बढ़ें।",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Next: Step 2 Email", "Explore as Guest"],
+      };
+    }
+    return {
+      reply: voiceMode
+        ? "Step 1: Enter your full name in the Full Name field, or speak your name to fill it automatically."
+        : "### Step 1: Full Name 👤\n\nEnter your full name into the **Full Name** field, or click **'Speak Name'** to speak your name. Once completed, you can move forward to Step 2 (Email).",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Next: Step 2 Email", "Explore as Guest"],
+    };
+  }
+
+  const isStep2 = q.includes("step 2") || (q.includes("step") && q.includes("two")) || (q.includes("email") && !q.includes("name"));
+  if (isStep2) {
+    if (isGujarati) {
+      return {
+        reply: voiceMode
+          ? "પગલું ૨: તમારું માન્ય ઇમેઇલ સરનામું દાખલ કરો અથવા બોલો."
+          : "### પગલું ૨: ઇમેઇલ સરનામું 📧\n\nતમારું માન્ય ઇમેઇલ દાખલ કરો અથવા 'Speak Email' ક્લિક કરીને બોલો. તે પછી તમે પગલું ૩ (પાસવર્ડ) પર આગળ વધી શકો છો.",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Next: Step 3 Password", "Back to Step 1"],
+      };
+    }
+    if (isHindi) {
+      return {
+        reply: voiceMode
+          ? "चरण 2: अपना मान्य ईमेल पता दर्ज करें या बोलकर बताएँ।"
+          : "### चरण 2: ईमेल पता 📧\n\n'Email Address' बॉक्स में अपना ईमेल लिखें या बोलकर भरें। इसके बाद चरण 3 (पासवर्ड) पर आगे बढ़ें।",
+        engine: "CareerForge Auth Co-Pilot",
+        suggestions: ["Next: Step 3 Password", "Back to Step 1"],
+      };
+    }
+    return {
+      reply: voiceMode
+        ? "Step 2: Enter your valid email address in the Email field, or speak your email."
+        : "### Step 2: Email Address 📧\n\nEnter your valid email address into the **Email Address** field, or click **'Speak Email'** to speak your email. Then proceed to Step 3 (Password).",
+      engine: "CareerForge Auth Co-Pilot",
+      suggestions: ["Next: Step 3 Password", "Back to Step 1"],
+    };
+  }
+
   // 3. Password Help Intent
   const isPassword =
     q.includes("password") ||

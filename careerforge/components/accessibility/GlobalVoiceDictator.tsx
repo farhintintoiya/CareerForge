@@ -21,6 +21,7 @@ import {
   normalizeSpokenEmail,
   normalizeSpokenName,
   getFieldPromptMessage,
+  setCommandBarActive,
 } from "@/lib/voice";
 
 // ─── Profile Questionnaire & Section Definitions ──────────────────────────────
@@ -261,6 +262,7 @@ export function GlobalVoiceDictator() {
   // ─── Interactive AI Voice Agent Dialogue State ──────────────────────────────
   const [aiSpeechPrompt, setAiSpeechPrompt] = useState<string | null>(null);
   const [isAiAnswering, setIsAiAnswering] = useState(false);
+  const [hudQueryText, setHudQueryText] = useState("");
 
   // ─── Questionnaire & Verification State ─────────────────────────────────────
   const [interviewState, setInterviewState] = useState<StoredInterviewState>(() => loadStoredInterview(user));
@@ -387,14 +389,68 @@ export function GlobalVoiceDictator() {
       currentQuestionRef.current = nextQ;
     };
 
+    const handleAuthSectionActive = (e: Event) => {
+      const custom = e as CustomEvent<{ section: "name" | "email" | "password"; mode?: string }>;
+      const sec = custom.detail?.section;
+      if (!sec) return;
+
+      const q = PROFILE_QUESTIONS.find((item) => item.id === sec);
+      if (q) {
+        setCurrentQuestion(q);
+        currentQuestionRef.current = q;
+        const isGu = currentLangRef.current === "gu-IN";
+        const isHi = currentLangRef.current === "hi-IN";
+        const promptText = isGu ? q.prompts.gu : isHi ? q.prompts.hi : q.prompts.en;
+        setAiSpeechPrompt(promptText);
+        setPendingVerification(null);
+        pendingVerificationRef.current = null;
+        showStatus(`🎙️ Step ${q.stepNumber} of 5: ${q.label}`, 3000);
+      }
+    };
+
+    const handleAuthValuesUpdate = (e: Event) => {
+      const custom = e as CustomEvent<{
+        name?: string;
+        email?: string;
+        password?: string;
+        isNameDone?: boolean;
+        isEmailDone?: boolean;
+        isPasswordDone?: boolean;
+      }>;
+      if (!custom.detail) return;
+      const { name, email, password, isNameDone, isEmailDone, isPasswordDone } = custom.detail;
+
+      setInterviewState((prev) => {
+        const completed = new Set(prev.completedQuestions);
+        if (isNameDone) completed.add("name");
+        if (isEmailDone) completed.add("email");
+        if (isPasswordDone) completed.add("password");
+
+        const updated: StoredInterviewState = {
+          ...prev,
+          name: name ?? prev.name,
+          email: email ?? prev.email,
+          password: password ?? prev.password,
+          completedQuestions: Array.from(completed),
+        };
+        interviewStateRef.current = updated;
+        saveStoredInterview(updated);
+        return updated;
+      });
+    };
+
     window.addEventListener("careerforge:field-dictation-start", handleFieldStart);
     window.addEventListener("careerforge:field-dictation-end", handleFieldEnd);
     window.addEventListener("careerforge:auth-mode-change", handleAuthMode);
+    window.addEventListener("careerforge:auth-section-active", handleAuthSectionActive);
+    window.addEventListener("careerforge:auth-values-update", handleAuthValuesUpdate);
 
     return () => {
       window.removeEventListener("careerforge:field-dictation-start", handleFieldStart);
       window.removeEventListener("careerforge:field-dictation-end", handleFieldEnd);
       window.removeEventListener("careerforge:auth-mode-change", handleAuthMode);
+      window.removeEventListener("careerforge:auth-section-active", handleAuthSectionActive);
+      window.removeEventListener("careerforge:auth-values-update", handleAuthValuesUpdate);
     };
   }, [showStatus, user]);
 
@@ -593,22 +649,28 @@ export function GlobalVoiceDictator() {
 
   // ─── Find Appropriate Target DOM Element for Live Typing ────────────────────
   const resolveTargetElement = useCallback((): HTMLInputElement | HTMLTextAreaElement | null => {
-    // 1. If user explicitly focused an element
+    // 1. Current active element user is directly interacting with (highest priority)
+    const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+    if (
+      activeEl &&
+      (activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement) &&
+      activeEl.type !== "hidden" &&
+      activeEl.type !== "submit" &&
+      activeEl.type !== "button"
+    ) {
+      return activeEl;
+    }
+
+    // 2. Focused element ref
     if (focusedElementRef.current && document.body.contains(focusedElementRef.current)) {
       return focusedElementRef.current;
     }
 
-    // 2. If active questionnaire question has a dedicated selector
+    // 3. If active questionnaire question has a dedicated selector
     const currentQ = currentQuestionRef.current;
     if (currentQ) {
       const match = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(currentQ.selector);
       if (match) return match;
-    }
-
-    // 3. If currently on active element that is an input/textarea
-    const activeEl = document.activeElement;
-    if (activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement) {
-      return activeEl;
     }
 
     // 4. Look for common inputs sequentially (name -> email -> password -> assistant textarea)
@@ -1096,6 +1158,108 @@ export function GlobalVoiceDictator() {
     [askAiAssistant, resolveTargetElement, setTargetRole, setUserSkills, setVoiceLanguage, showStatus, speakAndListen, user]
   );
 
+  // ─── Direct HUD Text Submission (Voice or Text Dual Modality) ───────────────
+  const handleHudTextSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      const query = hudQueryText.trim();
+      if (!query) return;
+
+      setHudQueryText("");
+      setLiveTranscript(query);
+
+      const lower = query.toLowerCase();
+      const isQuestion =
+        lower.endsWith("?") ||
+        lower.startsWith("what") ||
+        lower.startsWith("how") ||
+        lower.startsWith("why") ||
+        lower.startsWith("can you") ||
+        lower.startsWith("explain") ||
+        lower.startsWith("tell me") ||
+        lower.startsWith("help") ||
+        lower.includes("help") ||
+        lower.includes("શું") ||
+        lower.includes("કેવી રીતે") ||
+        lower.includes("कैसे") ||
+        lower.includes("क्या");
+
+      if (isQuestion) {
+        askAiAssistant(query, currentLangRef.current);
+        return;
+      }
+
+      const activeQ = currentQuestionRef.current;
+      if (activeQ) {
+        let candidateAnswer = query;
+        if (activeQ.id === "name") {
+          candidateAnswer = normalizeSpokenName(query);
+        } else if (activeQ.id === "email") {
+          candidateAnswer = normalizeSpokenEmail(query);
+        }
+
+        const targetEl =
+          document.querySelector<HTMLInputElement | HTMLTextAreaElement>(activeQ.selector) ||
+          resolveTargetElement();
+        if (targetEl) {
+          setNativeInputValue(targetEl, candidateAnswer);
+        }
+
+        setInterviewState((prev) => {
+          const newCompleted = Array.from(new Set([...prev.completedQuestions, activeQ.id]));
+          const updatedState: StoredInterviewState = {
+            ...prev,
+            [activeQ.id]: candidateAnswer,
+            completedQuestions: newCompleted,
+          };
+          interviewStateRef.current = updatedState;
+          saveStoredInterview(updatedState);
+
+          const nextQ = getNextRemainingQuestion(newCompleted, user);
+          setCurrentQuestion(nextQ);
+          currentQuestionRef.current = nextQ;
+
+          if (nextQ) {
+            if (nextQ.id === "name" || nextQ.id === "email" || nextQ.id === "password") {
+              window.dispatchEvent(
+                new CustomEvent("careerforge:auth-section", { detail: { section: nextQ.id } })
+              );
+            }
+            const nextEl = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(nextQ.selector);
+            if (nextEl) {
+              nextEl.scrollIntoView({ behavior: "smooth", block: "center" });
+              nextEl.focus();
+              focusedElementRef.current = nextEl;
+            }
+            const isGu = currentLangRef.current === "gu-IN";
+            const isHi = currentLangRef.current === "hi-IN";
+            const promptText = isGu ? nextQ.prompts.gu : isHi ? nextQ.prompts.hi : nextQ.prompts.en;
+            setAiSpeechPrompt(promptText);
+            showStatus(`🎙️ Step ${nextQ.stepNumber} of 5: ${nextQ.label}`, 4000);
+            speakAndListen(promptText);
+          } else {
+            const allDone = "Awesome! All sections are complete and verified.";
+            setAiSpeechPrompt(allDone);
+            speakAndListen(allDone);
+          }
+          return updatedState;
+        });
+
+        playAccessibleChime("success");
+        return;
+      }
+
+      const targetEl = resolveTargetElement();
+      if (targetEl) {
+        setNativeInputValue(targetEl, query);
+        playAccessibleChime("success");
+      } else {
+        askAiAssistant(query, currentLangRef.current);
+      }
+    },
+    [askAiAssistant, hudQueryText, resolveTargetElement, showStatus, speakAndListen, user]
+  );
+
   // ─── Start & Stop Voice Assistant ───────────────────────────────────────────
   const startVoiceDictation = useCallback(() => {
     if (!isSpeechRecognitionSupported()) {
@@ -1121,14 +1285,26 @@ export function GlobalVoiceDictator() {
         );
       }
 
-      setTimeout(() => {
-        const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(nextQ.selector);
-        if (el) {
-          el.scrollIntoView({ behavior: "smooth", block: "center" });
-          el.focus();
-          focusedElementRef.current = el;
-        }
-      }, 300);
+      // Safeguard: Only autofocus if user is not already actively focused on a form input
+      const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+      const isAlreadyOnInput =
+        activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement;
+      if (!isAlreadyOnInput) {
+        setTimeout(() => {
+          const currentActive = typeof document !== "undefined" ? document.activeElement : null;
+          if (
+            !currentActive ||
+            !(currentActive instanceof HTMLInputElement || currentActive instanceof HTMLTextAreaElement)
+          ) {
+            const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(nextQ.selector);
+            if (el) {
+              el.scrollIntoView({ behavior: "smooth", block: "center" });
+              el.focus();
+              focusedElementRef.current = el;
+            }
+          }
+        }, 300);
+      }
 
       const isGu = currentLangRef.current === "gu-IN";
       const isHi = currentLangRef.current === "hi-IN";
@@ -1334,6 +1510,31 @@ export function GlobalVoiceDictator() {
                 </span>
               </div>
             )}
+
+            {/* Interactive Text Input Composer (Voice or Text Dual Modality) */}
+            <form
+              onSubmit={handleHudTextSubmit}
+              className="mt-2.5 flex items-center gap-1.5 border-t border-neutral-100 pt-2.5"
+            >
+              <input
+                type="text"
+                value={hudQueryText}
+                onChange={(e) => setHudQueryText(e.target.value)}
+                placeholder={
+                  currentQuestion
+                    ? `Type ${currentQuestion.label} or ask AI...`
+                    : "Type a question or message to CareerForge AI..."
+                }
+                className="flex-1 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-xs text-neutral-900 placeholder:text-neutral-400 focus:border-neutral-900 focus:bg-white focus:outline-none transition-colors"
+              />
+              <button
+                type="submit"
+                disabled={isAiAnswering || !hudQueryText.trim()}
+                className="rounded-lg bg-neutral-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-neutral-800 disabled:opacity-40 transition-opacity cursor-pointer shrink-0"
+              >
+                {isAiAnswering ? "..." : "Send"}
+              </button>
+            </form>
           </div>
         )}
 
