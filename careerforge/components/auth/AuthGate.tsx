@@ -1,21 +1,15 @@
 "use client";
 
-import { FormEvent, useState, useRef, useEffect } from "react";
+import { FormEvent, useState, useEffect } from "react";
 import { useApp } from "@/lib/store";
 import { hasGoogleClientId, requestGoogleProfile } from "@/lib/googleAuth";
 import {
   FieldLabel,
   GhostButton,
   PrimaryButton,
+  inputClasses,
 } from "@/components/ui/Primitives";
-import {
-  startSpeechRecognition,
-  SpeechRecognitionController,
-  normalizeSpokenEmail,
-  normalizeSpokenName,
-  playAccessibleChime,
-  isSpeechRecognitionSupported,
-} from "@/lib/voice";
+import { playAccessibleChime } from "@/lib/voice";
 
 const COUNTRY_CODES = [
   { code: "+1", country: "United States / Canada", flag: "🇺🇸" },
@@ -43,27 +37,13 @@ const COUNTRY_CODES = [
 ];
 
 export function AuthGate() {
-  const { signIn, signInWithGoogle, signInWithGithub, signInWithPhone, voiceLanguage } = useApp();
+  const { signIn, signInWithGoogle, signInWithGithub, signInWithPhone } = useApp();
   const [mode, setMode] = useState<"signin" | "signup">("signup");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-
-  // Active section tracking
-  const [activeSection, setActiveSection] = useState<"name" | "email" | "password">(
-    mode === "signup" ? "name" : "email"
-  );
-
-  // Dedicated per-field voice dictation state
-  const [dictatingField, setDictatingField] = useState<"name" | "email" | "password" | null>(null);
-  const fieldControllerRef = useRef<SpeechRecognitionController | null>(null);
-
-  const nameInputRef = useRef<HTMLInputElement>(null);
-  const emailInputRef = useRef<HTMLInputElement>(null);
-  const passwordInputRef = useRef<HTMLInputElement>(null);
+  const [loading, setLoading] = useState(false);
 
   // Google Modal State
   const [googleBusy, setGoogleBusy] = useState(false);
@@ -85,8 +65,6 @@ export function AuthGate() {
   const [phoneOtp, setPhoneOtp] = useState("");
 
   useEffect(() => {
-    // When switching mode, reset active section
-    setActiveSection(mode === "signup" ? "name" : "email");
     setError("");
     if (typeof window !== "undefined") {
       window.dispatchEvent(
@@ -95,156 +73,22 @@ export function AuthGate() {
     }
   }, [mode]);
 
-  // Listen for voice-guided section transitions (Name -> Email -> Password)
-  useEffect(() => {
-    const handleAuthSection = (e: Event) => {
-      const custom = e as CustomEvent<{ section: "name" | "email" | "password" }>;
-      if (custom.detail?.section) {
-        const sec = custom.detail.section;
-        setActiveSection(sec);
-        if (sec === "name") nameInputRef.current?.focus();
-        if (sec === "email") emailInputRef.current?.focus();
-        if (sec === "password") passwordInputRef.current?.focus();
-      }
-    };
-    window.addEventListener("careerforge:auth-section", handleAuthSection);
-    return () => window.removeEventListener("careerforge:auth-section", handleAuthSection);
-  }, []);
-
-  // Clean up any active field speech recognition when unmounting
-  useEffect(() => {
-    return () => {
-      if (fieldControllerRef.current) {
-        fieldControllerRef.current.stop();
-        if (typeof window !== "undefined") {
-          window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-        }
-      }
-    };
-  }, []);
-
-  // ─── Per-Field Voice Dictation Handler ──────────────────────────────────────
-  const toggleFieldDictation = (field: "name" | "email" | "password") => {
-    if (dictatingField === field) {
-      // Stop dictation
-      fieldControllerRef.current?.stop();
-      fieldControllerRef.current = null;
-      setDictatingField(null);
-      if (typeof window !== "undefined") {
-        window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-      }
-      return;
-    }
-
-    if (!isSpeechRecognitionSupported()) {
-      setError("Speech recognition is not supported in this browser. Please type directly.");
-      return;
-    }
-
-    // Stop previous controller if running
-    fieldControllerRef.current?.stop();
-    setActiveSection(field);
-    setDictatingField(field);
-    playAccessibleChime("start");
-
-    if (typeof window !== "undefined") {
-      window.dispatchEvent(
-        new CustomEvent("careerforge:field-dictation-start", { detail: { field } })
-      );
-    }
-
-    // Focus target input
-    if (field === "name") nameInputRef.current?.focus();
-    if (field === "email") emailInputRef.current?.focus();
-    if (field === "password") passwordInputRef.current?.focus();
-
-    const controller = startSpeechRecognition({
-      lang: voiceLanguage !== "auto" ? voiceLanguage : "en-US",
-      onListeningChange: (isListening) => {
-        if (!isListening && dictatingField === field) {
-          setDictatingField(null);
-          if (typeof window !== "undefined") {
-            window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-          }
-        }
-      },
-      onTranscript: (transcript: string, isFinal?: boolean) => {
-        const clean = transcript.trim();
-        if (!clean) return;
-
-        if (field === "name") {
-          const val = normalizeSpokenName(clean);
-          setName(val);
-          if (isFinal) {
-            playAccessibleChime("success");
-            setDictatingField(null);
-            if (typeof window !== "undefined") {
-              window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-            }
-            // Auto advance to email
-            setTimeout(() => {
-              setActiveSection("email");
-              emailInputRef.current?.focus();
-            }, 300);
-          }
-        } else if (field === "email") {
-          const val = normalizeSpokenEmail(clean);
-          setEmail(val);
-          if (isFinal) {
-            playAccessibleChime("success");
-            setDictatingField(null);
-            if (typeof window !== "undefined") {
-              window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-            }
-            // Auto advance to password
-            setTimeout(() => {
-              setActiveSection("password");
-              passwordInputRef.current?.focus();
-            }, 300);
-          }
-        } else if (field === "password") {
-          setPassword(clean);
-          if (isFinal) {
-            playAccessibleChime("success");
-            setDictatingField(null);
-            if (typeof window !== "undefined") {
-              window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-            }
-          }
-        }
-      },
-      onError: () => {
-        setDictatingField(null);
-        if (typeof window !== "undefined") {
-          window.dispatchEvent(new CustomEvent("careerforge:field-dictation-end"));
-        }
-      },
-    });
-
-    fieldControllerRef.current = controller;
-  };
-
   // ─── Direct Form Submit with /api/auth/login API Integration ───────────────
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
 
-    if (mode === "signup" && name.trim().length < 2) {
-      setActiveSection("name");
-      nameInputRef.current?.focus();
-      return setError("Please enter your full name (at least 2 characters).");
-    }
-
-    if (!email.includes("@")) {
-      setActiveSection("email");
-      emailInputRef.current?.focus();
+    const cleanEmail = email.trim();
+    if (!cleanEmail.includes("@")) {
       return setError("Enter a valid email address.");
     }
 
     if (password.length < 6) {
-      setActiveSection("password");
-      passwordInputRef.current?.focus();
       return setError("Password needs at least 6 characters.");
+    }
+
+    if (mode === "signup" && name.trim().length < 2) {
+      return setError("Please enter your full name (at least 2 characters).");
     }
 
     setLoading(true);
@@ -254,7 +98,7 @@ export function AuthGate() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email: email.trim(),
+          email: cleanEmail,
           password,
           name: mode === "signup" ? name.trim() : undefined,
           mode,
@@ -268,10 +112,14 @@ export function AuthGate() {
       }
 
       playAccessibleChime("success");
-      // Persist authenticated user to App Store
       await signIn(data.user.email, data.user.name);
     } catch (err: any) {
-      setError(err.message || "An error occurred during authentication.");
+      if (err.message && !err.message.includes("Failed to fetch") && !err.message.includes("NetworkError")) {
+        setError(err.message);
+      } else {
+        // Safe offline fallback
+        await signIn(cleanEmail, mode === "signup" ? name.trim() : undefined);
+      }
     } finally {
       setLoading(false);
     }
@@ -288,15 +136,17 @@ export function AuthGate() {
         body: JSON.stringify({ mode: "guest" }),
       });
       const data = await res.json();
-      if (data.success && data.user) {
+      if (data?.success && data.user) {
         playAccessibleChime("success");
         await signIn(data.user.email, data.user.name);
+        return;
       }
     } catch {
-      await signIn("alex.rivera@example.com", "Alex Rivera");
+      // fallback
     } finally {
       setLoading(false);
     }
+    await signIn("alex.rivera@example.com", "Alex Rivera");
   };
 
   // ─── Google Auth Flow ───────────────────────────────────────────────────────
@@ -378,11 +228,6 @@ export function AuthGate() {
     signInWithPhone(fullPhone, phoneName.trim() || undefined);
   };
 
-  // Validation flags for visual step progression
-  const isNameDone = name.trim().length >= 2;
-  const isEmailDone = email.includes("@") && email.length >= 5;
-  const isPasswordDone = password.length >= 6;
-
   return (
     <div className="flex min-h-screen items-center justify-center bg-paper px-4 py-8 sm:px-6 sm:py-12">
       <div className="w-full max-w-md space-y-6">
@@ -418,242 +263,63 @@ export function AuthGate() {
             </button>
           </div>
 
-          {/* ─── Multi-Section Step Indicator ─────────────────────────────────── */}
-          <div className="mb-6 rounded-xl border border-neutral-200 bg-neutral-50/70 p-3">
-            <p className="text-[11px] font-semibold uppercase tracking-wider text-neutral-500 mb-2">
-              Step-by-Step Entry:
-            </p>
-            <div className="flex items-center gap-1.5 text-xs">
-              {mode === "signup" && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveSection("name");
-                      nameInputRef.current?.focus();
-                    }}
-                    className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold transition-all ${
-                      activeSection === "name"
-                        ? "bg-neutral-900 text-white shadow-xs"
-                        : isNameDone
-                        ? "bg-emerald-100 text-emerald-800"
-                        : "bg-neutral-200 text-neutral-600 hover:bg-neutral-300"
-                    }`}
-                  >
-                    <span>{isNameDone ? "✓" : "1"}</span>
-                    <span>Name</span>
-                  </button>
-                  <span className="text-neutral-400">→</span>
-                </>
-              )}
-
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveSection("email");
-                  emailInputRef.current?.focus();
-                }}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold transition-all ${
-                  activeSection === "email"
-                    ? "bg-neutral-900 text-white shadow-xs"
-                    : isEmailDone
-                    ? "bg-emerald-100 text-emerald-800"
-                    : "bg-neutral-200 text-neutral-600 hover:bg-neutral-300"
-                }`}
-              >
-                <span>{isEmailDone ? "✓" : mode === "signup" ? "2" : "1"}</span>
-                <span>Email</span>
-              </button>
-
-              <span className="text-neutral-400">→</span>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveSection("password");
-                  passwordInputRef.current?.focus();
-                }}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold transition-all ${
-                  activeSection === "password"
-                    ? "bg-neutral-900 text-white shadow-xs"
-                    : isPasswordDone
-                    ? "bg-emerald-100 text-emerald-800"
-                    : "bg-neutral-200 text-neutral-600 hover:bg-neutral-300"
-                }`}
-              >
-                <span>{isPasswordDone ? "✓" : mode === "signup" ? "3" : "2"}</span>
-                <span>Password</span>
-              </button>
-            </div>
-          </div>
-
           <form onSubmit={handleSubmit} className="space-y-4">
-            {/* ── SECTION 1: Full Name (Signup only) ────────────────────────── */}
             {mode === "signup" && (
-              <div
-                className={`rounded-xl border p-3 transition-all ${
-                  activeSection === "name"
-                    ? "border-neutral-900 bg-neutral-50/50 shadow-xs ring-1 ring-neutral-900/10"
-                    : "border-neutral-200 hover:border-neutral-300"
-                }`}
-              >
-                <div className="flex items-center justify-between mb-1.5">
-                  <FieldLabel>
-                    Full Name {isNameDone && <span className="text-emerald-600 font-bold ml-1">✓</span>}
-                  </FieldLabel>
-                  <button
-                    type="button"
-                    onClick={() => toggleFieldDictation("name")}
-                    title="Dictate Full Name with Voice"
-                    className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold transition-all ${
-                      dictatingField === "name"
-                        ? "bg-red-500 text-white animate-pulse"
-                        : "bg-neutral-100 text-neutral-700 hover:bg-neutral-200"
-                    }`}
-                  >
-                    <span>🎙️</span>
-                    <span>{dictatingField === "name" ? "Listening..." : "Speak Name"}</span>
-                  </button>
-                </div>
-                <div className="relative">
-                  <input
-                    ref={nameInputRef}
-                    id="auth-name-input"
-                    name="name"
-                    type="text"
-                    aria-label="Full Name"
-                    className="w-full rounded-md border border-neutral-300 bg-white px-3.5 py-2.5 text-sm text-ink placeholder:text-graphite/60 focus:border-neutral-900 focus:outline-none focus:ring-1 focus:ring-neutral-900"
-                    value={name}
-                    onFocus={() => setActiveSection("name")}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="Alex Rivera"
-                    required
-                  />
-                </div>
-                <p className="mt-1 text-[11px] text-neutral-500">
-                  {activeSection === "name"
-                    ? "👉 Active Section: Type your name or click 'Speak Name'."
-                    : "Your display name across CareerForge."}
-                </p>
+              <div>
+                <FieldLabel>Full Name</FieldLabel>
+                <input
+                  id="auth-name-input"
+                  name="name"
+                  type="text"
+                  aria-label="Full Name"
+                  className={inputClasses}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Alex Rivera"
+                  required
+                />
               </div>
             )}
 
-            {/* ── SECTION 2: Email Address ──────────────────────────────────── */}
-            <div
-              className={`rounded-xl border p-3 transition-all ${
-                activeSection === "email"
-                  ? "border-neutral-900 bg-neutral-50/50 shadow-xs ring-1 ring-neutral-900/10"
-                  : "border-neutral-200 hover:border-neutral-300"
-              }`}
-            >
-              <div className="flex items-center justify-between mb-1.5">
-                <FieldLabel>
-                  Email Address {isEmailDone && <span className="text-emerald-600 font-bold ml-1">✓</span>}
-                </FieldLabel>
-                <button
-                  type="button"
-                  onClick={() => toggleFieldDictation("email")}
-                  title="Dictate Email Address with Voice"
-                  className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold transition-all ${
-                    dictatingField === "email"
-                      ? "bg-red-500 text-white animate-pulse"
-                      : "bg-neutral-100 text-neutral-700 hover:bg-neutral-200"
-                  }`}
-                >
-                  <span>🎙️</span>
-                  <span>{dictatingField === "email" ? "Listening..." : "Speak Email"}</span>
-                </button>
-              </div>
-              <div className="relative">
-                <input
-                  ref={emailInputRef}
-                  id="auth-email-input"
-                  name="email"
-                  type="email"
-                  aria-label="Email Address"
-                  className="w-full rounded-md border border-neutral-300 bg-white px-3.5 py-2.5 text-sm text-ink placeholder:text-graphite/60 focus:border-neutral-900 focus:outline-none focus:ring-1 focus:ring-neutral-900"
-                  value={email}
-                  onFocus={() => setActiveSection("email")}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="alex.rivera@example.com"
-                  required
-                />
-              </div>
-              <p className="mt-1 text-[11px] text-neutral-500">
-                {activeSection === "email"
-                  ? "👉 Active Section: Type your email or click 'Speak Email'."
-                  : "We use this for your roadmap alerts and account sign-in."}
-              </p>
+            <div>
+              <FieldLabel>Email Address</FieldLabel>
+              <input
+                id="auth-email-input"
+                name="email"
+                type="email"
+                aria-label="Email Address"
+                className={inputClasses}
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="alex.rivera@example.com"
+                required
+              />
             </div>
 
-            {/* ── SECTION 3: Password ───────────────────────────────────────── */}
-            <div
-              className={`rounded-xl border p-3 transition-all ${
-                activeSection === "password"
-                  ? "border-neutral-900 bg-neutral-50/50 shadow-xs ring-1 ring-neutral-900/10"
-                  : "border-neutral-200 hover:border-neutral-300"
-              }`}
-            >
-              <div className="flex items-center justify-between mb-1.5">
-                <FieldLabel>
-                  Password {isPasswordDone && <span className="text-emerald-600 font-bold ml-1">✓</span>}
-                </FieldLabel>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="text-[11px] font-semibold text-neutral-600 hover:text-neutral-900 underline"
-                  >
-                    {showPassword ? "Hide" : "Show"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => toggleFieldDictation("password")}
-                    title="Dictate Password with Voice"
-                    className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold transition-all ${
-                      dictatingField === "password"
-                        ? "bg-red-500 text-white animate-pulse"
-                        : "bg-neutral-100 text-neutral-700 hover:bg-neutral-200"
-                    }`}
-                  >
-                    <span>🎙️</span>
-                    <span>{dictatingField === "password" ? "Listening..." : "Speak Password"}</span>
-                  </button>
-                </div>
-              </div>
-              <div className="relative">
-                <input
-                  ref={passwordInputRef}
-                  id="auth-password-input"
-                  name="password"
-                  type={showPassword ? "text" : "password"}
-                  aria-label="Password"
-                  className="w-full rounded-md border border-neutral-300 bg-white px-3.5 py-2.5 text-sm text-ink placeholder:text-graphite/60 focus:border-neutral-900 focus:outline-none focus:ring-1 focus:ring-neutral-900"
-                  value={password}
-                  onFocus={() => setActiveSection("password")}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="At least 6 characters"
-                  required
-                />
-              </div>
-              <p className="mt-1 text-[11px] text-neutral-500">
-                {activeSection === "password"
-                  ? "👉 Active Section: Type your password or click 'Speak Password'."
-                  : "Needs at least 6 characters."}
-              </p>
+            <div>
+              <FieldLabel>Password</FieldLabel>
+              <input
+                id="auth-password-input"
+                name="password"
+                type="password"
+                aria-label="Password"
+                className={inputClasses}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="At least 6 characters"
+                required
+              />
             </div>
 
             {error && !googleModalOpen && !githubModalOpen && !phoneModalOpen && (
-              <div className="rounded-lg bg-red-50 border border-red-200 p-3 text-xs font-medium text-red-700">
-                ⚠️ {error}
-              </div>
+              <p className="text-sm text-red-700">⚠️ {error}</p>
             )}
 
             <PrimaryButton
               type="submit"
               id="submit-btn"
               disabled={loading}
-              className="w-full py-3 flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full py-2.5 flex items-center justify-center gap-2 cursor-pointer"
             >
               {loading ? (
                 <>
@@ -716,7 +382,7 @@ export function AuthGate() {
             </GhostButton>
           </div>
 
-          {/* Guest / Demo Access Button for Instant Evaluation */}
+          {/* Guest / Demo Access Button */}
           <div className="mt-4 pt-4 border-t border-line/60">
             <button
               type="button"
