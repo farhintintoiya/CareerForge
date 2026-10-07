@@ -5,19 +5,44 @@ import { useSearchParams } from "next/navigation";
 import { useApp } from "@/lib/store";
 import { roleOptions } from "@/lib/data";
 import { RoleId } from "@/lib/types";
+import dynamic from "next/dynamic";
+import type { CareerNodeId } from "@/components/ubix/UbixCareerGraph";
+import { Safe3DBoundary } from "@/components/ubix/Safe3DBoundary";
+
+const UbixCareerGraph = dynamic(
+  () => import("@/components/ubix/UbixCareerGraph").then((m) => m.UbixCareerGraph),
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        className="w-full h-full min-h-[580px] rounded-3xl border border-hairline bg-bg flex items-center justify-center"
+        aria-hidden="true"
+      >
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-16 h-16 rounded-full border border-hairline bg-surface animate-pulse flex items-center justify-center">
+            <span className="font-display font-bold text-white text-xs">ubix</span>
+          </div>
+          <span className="text-xs font-mono text-graphite">Loading Career Universe...</span>
+        </div>
+      </div>
+    ),
+  }
+);
 import { CareerRoadmap } from "@/components/roadmap/CareerRoadmap";
-import { UbixCareerGraph, CareerNodeId } from "@/components/ubix/UbixCareerGraph";
 import { CourseCards } from "@/components/courses/CourseCards";
 import { CareerTelemetry } from "@/components/progress/CareerTelemetry";
+import { EvidenceWallet } from "@/components/career/EvidenceWallet";
+import { CareerGapExplainer } from "@/components/career/CareerGapExplainer";
 import {
   Map,
   Compass,
   BookOpen,
   TrendingUp,
+  ShieldCheck,
   ChevronDown,
 } from "lucide-react";
 
-export type RoadmapSubTab = "roadmap" | "journey" | "learning" | "progress";
+export type RoadmapSubTab = "roadmap" | "journey" | "evidence" | "gaps" | "learning" | "progress";
 
 export default function RoadmapPage() {
   const searchParams = useSearchParams();
@@ -32,7 +57,7 @@ export default function RoadmapPage() {
 
   useEffect(() => {
     const tab = searchParams.get("tab") as RoadmapSubTab;
-    if (tab && ["roadmap", "journey", "learning", "progress"].includes(tab)) {
+    if (tab && ["roadmap", "journey", "evidence", "gaps", "learning", "progress"].includes(tab)) {
       setActiveTab(tab);
     }
   }, [searchParams]);
@@ -40,6 +65,8 @@ export default function RoadmapPage() {
   const navItems = [
     { id: "journey", label: "Spatial Constellation", icon: <Compass size={13} strokeWidth={2} /> },
     { id: "roadmap", label: "Phased Milestones", icon: <Map size={13} strokeWidth={2} /> },
+    { id: "evidence", label: "Evidence Wallet", icon: <ShieldCheck size={13} strokeWidth={2} /> },
+    { id: "gaps", label: "Gap Explainer", icon: <TrendingUp size={13} strokeWidth={2} /> },
     { id: "learning", label: "Curated Learning", icon: <BookOpen size={13} strokeWidth={2} /> },
     { id: "progress", label: "Progress Telemetry", icon: <TrendingUp size={13} strokeWidth={2} /> },
   ];
@@ -143,10 +170,24 @@ export default function RoadmapPage() {
                 Select a node to inspect skills, milestones, and training drills.
               </p>
             </div>
-            <UbixCareerGraph
-              onNodeSelect={handleGraphNodeSelect}
-              onCtaClick={handleGraphNodeSelect}
-            />
+            <Safe3DBoundary onCtaClick={handleGraphNodeSelect}>
+              <UbixCareerGraph
+                onNodeSelect={handleGraphNodeSelect}
+                onCtaClick={handleGraphNodeSelect}
+              />
+            </Safe3DBoundary>
+          </div>
+        )}
+
+        {activeTab === "evidence" && (
+          <div className="app-shell py-8">
+            <EvidenceWallet />
+          </div>
+        )}
+
+        {activeTab === "gaps" && (
+          <div className="app-shell py-8">
+            <CareerGapExplainer roleTitle={roleOptions.find((r) => r.id === role)?.label} />
           </div>
         )}
 
